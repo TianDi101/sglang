@@ -9,6 +9,7 @@ Follows the same pattern as MooncakeStore:
 import logging
 import os
 import socket
+import threading
 from typing import Any, List, Optional
 
 import torch
@@ -530,6 +531,24 @@ class UMBPStore(HiCacheStorage):
             cfg.ssd_backend,
         )
 
+        # ------------------------------------------------------------------
+        # Optional KV events subscriber
+        # Enabled via extra_config["kv_events_subscriber"] = True/1/"true".
+        # Extra knobs:
+        #   kv_events_endpoint — ZMQ connect address (default "tcp://localhost:5557")
+        #   kv_events_topic    — topic filter matching the server's topic (default "")
+        # ------------------------------------------------------------------
+        self._kv_events_subscriber: Optional[KVEventsSubscriber] = None
+        if _bool_from_any(extra.get("kv_events_subscriber", False)) and self.local_rank == 0:
+            kv_endpoint = str(extra.get("kv_events_endpoint", "tcp://localhost:5557"))
+            kv_topic = str(extra.get("kv_events_topic", ""))
+            self._kv_events_subscriber = KVEventsSubscriber(
+                umbp_client=self.client,
+                endpoint=kv_endpoint,
+                topic=kv_topic,
+            )
+            self._kv_events_subscriber.start()
+
     # ------------------------------------------------------------------
     # Host memory pool registration
     # ------------------------------------------------------------------
@@ -794,6 +813,12 @@ class UMBPStore(HiCacheStorage):
         return bool(self.client.flush())
 
     def close(self) -> None:
+        if getattr(self, "_kv_events_subscriber", None) is not None:
+            try:
+                self._kv_events_subscriber.stop()
+            except Exception:
+                logger.exception("KVEventsSubscriber stop during close failed")
+            self._kv_events_subscriber = None
         if getattr(self, "client", None) is None:
             return
         try:
@@ -801,3 +826,137 @@ class UMBPStore(HiCacheStorage):
         except Exception:
             logger.exception("UMBPStore flush during close failed")
         self.client = None
+
+
+class KVEventsSubscriber:
+    """Subscribe to SGLang KV cache events published over ZMQ and forward
+    them to the UMBP Master via ``umbp_client``.
+
+    Runs a background thread that receives :class:`KVEventBatch` messages
+    from a ``ZmqEventPublisher`` and dispatches each individual event to
+    :meth:`on_event`.
+
+    Parameters
+    ----------
+    umbp_client:
+        The ``UMBPClient`` instance owned by the parent ``UMBPStore``.
+        Will be used to publish events to the UMBP Master.
+    endpoint:
+        ZMQ endpoint of the SGLang publisher, e.g. ``"tcp://localhost:5557"``.
+        For DP attention rank *N*, the port is offset by *N* (rank 0 → 5557,
+        rank 1 → 5558, …).
+    topic:
+        Topic filter passed to ``zmq.SUBSCRIBE``.  Must match the ``topic``
+        set in ``KVEventsConfig`` on the server side.  Empty string subscribes
+        to everything.
+    poll_timeout_ms:
+        How long (in milliseconds) the receiver thread waits for a message
+        before looping and checking the stop flag.
+    """
+
+    def __init__(
+        self,
+        umbp_client: Any,
+        endpoint: str = "tcp://localhost:5557",
+        topic: str = "",
+        poll_timeout_ms: int = 100,
+    ) -> None:
+        self._umbp_client = umbp_client
+        self._endpoint = endpoint
+        self._topic = topic
+        self._poll_timeout_ms = poll_timeout_ms
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Start the subscriber background thread."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="kv-events-subscriber",
+        )
+        self._thread.start()
+        logger.info(
+            "KVEventsSubscriber started: endpoint=%s, topic=%r",
+            self._endpoint,
+            self._topic,
+        )
+
+    def stop(self, timeout: float = 2.0) -> None:
+        """Signal the subscriber thread to stop and wait for it to finish."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+        logger.info("KVEventsSubscriber stopped")
+
+    # ------------------------------------------------------------------
+    # Event handler
+    # ------------------------------------------------------------------
+
+    def on_event(self, event: Any, batch_ts: float, attn_dp_rank: Optional[int]) -> None:
+        """Called once per individual KV cache event.
+
+        Parameters
+        ----------
+        event:
+            One of :class:`~sglang.srt.disaggregation.kv_events.BlockStored`,
+            :class:`~sglang.srt.disaggregation.kv_events.BlockRemoved`, or
+            :class:`~sglang.srt.disaggregation.kv_events.AllBlocksCleared`.
+        batch_ts:
+            Unix timestamp of the :class:`KVEventBatch` that contained this event.
+        attn_dp_rank:
+            DP attention rank that produced the event, or ``None`` for rank 0.
+        """
+        print(
+            f"[KVEvent] dp_rank={attn_dp_rank} ts={batch_ts:.6f} "
+            f"type={type(event).__name__} event={event}"
+        )
+        # TODO: use self._umbp_client to publish the event to the UMBP Master
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _run(self) -> None:
+        import zmq
+        from msgspec.msgpack import Decoder
+
+        from sglang.srt.disaggregation.kv_events import KVEventBatch
+
+        decoder = Decoder(type=KVEventBatch)
+        ctx = zmq.Context.instance()
+        sub = ctx.socket(zmq.SUB)
+        sub.connect(self._endpoint)
+        sub.setsockopt_string(zmq.SUBSCRIBE, self._topic)
+        logger.debug(
+            "KVEventsSubscriber connected to %s, topic=%r", self._endpoint, self._topic
+        )
+
+        try:
+            while not self._stop_event.is_set():
+                if not sub.poll(self._poll_timeout_ms):
+                    continue
+                try:
+                    parts = sub.recv_multipart()
+                    # Publisher sends: [topic, seq_bytes, payload]
+                    if len(parts) != 3:
+                        logger.warning(
+                            "Unexpected frame count %d from publisher", len(parts)
+                        )
+                        continue
+                    _, _seq_bytes, payload = parts
+                    batch = decoder.decode(payload)
+                    for event in batch.events:
+                        self.on_event(event, batch.ts, batch.attn_dp_rank)
+                except Exception:
+                    logger.exception("KVEventsSubscriber error decoding message")
+        finally:
+            sub.close(linger=0)
