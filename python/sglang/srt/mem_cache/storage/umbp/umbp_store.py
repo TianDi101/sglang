@@ -867,6 +867,15 @@ class KVEventsSubscriber:
         self._poll_timeout_ms = poll_timeout_ms
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Track reported hashes so AllBlocksCleared can revoke them all.
+        self._reported_hashes: set = set()
+        self._hashes_lock = threading.Lock()
+        # Cache UMBPTierType constants to avoid repeated attribute lookups.
+        import mori.umbp as _umbp_mod
+
+        _tier = _umbp_mod.UMBPTierType
+        self._tier_hbm = _tier.HBM
+        self._tier_dram = _tier.DRAM
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -901,8 +910,22 @@ class KVEventsSubscriber:
     # Event handler
     # ------------------------------------------------------------------
 
+    def _medium_to_tier(self, medium: Optional[str]) -> Any:
+        """Map a KV event medium string to a UMBPTierType value.
+
+        ``MEDIUM_GPU`` ("GPU") maps to HBM (GPU on-chip memory).
+        All other values (CPU pinned, unknown) map to DRAM.
+        """
+        from sglang.srt.disaggregation.kv_events import MEDIUM_GPU
+
+        return self._tier_hbm if medium == MEDIUM_GPU else self._tier_dram
+
     def on_event(self, event: Any, batch_ts: float, attn_dp_rank: Optional[int]) -> None:
         """Called once per individual KV cache event.
+
+        Translates SGLang KV cache events into UMBP external KV block
+        report / revoke calls so the UMBP Master can track which GPU/CPU
+        blocks are available on each node for cross-node cache lookup.
 
         Parameters
         ----------
@@ -915,11 +938,53 @@ class KVEventsSubscriber:
         attn_dp_rank:
             DP attention rank that produced the event, or ``None`` for rank 0.
         """
-        print(
-            f"[KVEvent] dp_rank={attn_dp_rank} ts={batch_ts:.6f} "
-            f"type={type(event).__name__} event={event}"
+        from sglang.srt.disaggregation.kv_events import (
+            AllBlocksCleared,
+            BlockRemoved,
+            BlockStored,
         )
-        # TODO: use self._umbp_client to publish the event to the UMBP Master
+
+        if isinstance(event, BlockStored):
+            hashes = [str(h) for h in event.block_hashes]
+            tier = self._medium_to_tier(event.medium)
+            ok = self._umbp_client.report_external_kv_blocks(hashes, tier)
+            if not ok:
+                logger.warning(
+                    "report_external_kv_blocks failed for %d hashes (dp_rank=%s)",
+                    len(hashes),
+                    attn_dp_rank,
+                )
+            with self._hashes_lock:
+                self._reported_hashes.update(hashes)
+
+        elif isinstance(event, BlockRemoved):
+            hashes = [str(h) for h in event.block_hashes]
+            ok = self._umbp_client.revoke_external_kv_blocks(hashes)
+            if not ok:
+                logger.warning(
+                    "revoke_external_kv_blocks failed for %d hashes (dp_rank=%s)",
+                    len(hashes),
+                    attn_dp_rank,
+                )
+            with self._hashes_lock:
+                self._reported_hashes.difference_update(hashes)
+
+        elif isinstance(event, AllBlocksCleared):
+            with self._hashes_lock:
+                all_hashes = list(self._reported_hashes)
+                self._reported_hashes.clear()
+            if all_hashes:
+                ok = self._umbp_client.revoke_external_kv_blocks(all_hashes)
+                if not ok:
+                    logger.warning(
+                        "revoke_external_kv_blocks (all-clear) failed for %d hashes",
+                        len(all_hashes),
+                    )
+
+        else:
+            logger.debug(
+                "KVEventsSubscriber: unhandled event type %s", type(event).__name__
+            )
 
     # ------------------------------------------------------------------
     # Internal
