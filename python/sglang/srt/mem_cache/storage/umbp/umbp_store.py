@@ -546,7 +546,16 @@ class UMBPStore(HiCacheStorage):
             # DP mode: all DP clients subscribe (filter by dp_rank in on_event).
             # TP-only mode: only rank 0 subscribes.
             if _is_dp_mode or self.local_rank == 0:
-                kv_endpoint = str(extra.get("kv_events_endpoint", "tcp://localhost:5557"))
+                from sglang.srt.disaggregation.kv_events import ZmqEventPublisher
+
+                kv_endpoint_base = str(
+                    extra.get("kv_events_endpoint", "tcp://localhost:5557")
+                )
+                kv_endpoint = (
+                    ZmqEventPublisher.offset_endpoint_port(kv_endpoint_base, _dp_rank)
+                    if _is_dp_mode
+                    else kv_endpoint_base
+                )
                 kv_topic = str(extra.get("kv_events_topic", ""))
                 self._kv_events_subscriber = KVEventsSubscriber(
                     umbp_client=self.client,
