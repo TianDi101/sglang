@@ -538,16 +538,23 @@ class UMBPStore(HiCacheStorage):
         #   kv_events_endpoint — ZMQ connect address (default "tcp://localhost:5557")
         #   kv_events_topic    — topic filter matching the server's topic (default "")
         # ------------------------------------------------------------------
+        _is_dp_mode = dp_rank_hint is not None and dp_size_hint is not None and dp_size_hint > 1
+        _dp_rank = dp_rank_hint if dp_rank_hint is not None else 0
+
         self._kv_events_subscriber: Optional[KVEventsSubscriber] = None
-        if _bool_from_any(extra.get("kv_events_subscriber", False)) and self.local_rank == 0:
-            kv_endpoint = str(extra.get("kv_events_endpoint", "tcp://localhost:5557"))
-            kv_topic = str(extra.get("kv_events_topic", ""))
-            self._kv_events_subscriber = KVEventsSubscriber(
-                umbp_client=self.client,
-                endpoint=kv_endpoint,
-                topic=kv_topic,
-            )
-            self._kv_events_subscriber.start()
+        if _bool_from_any(extra.get("kv_events_subscriber", False)):
+            # DP mode: all DP clients subscribe (filter by dp_rank in on_event).
+            # TP-only mode: only rank 0 subscribes.
+            if _is_dp_mode or self.local_rank == 0:
+                kv_endpoint = str(extra.get("kv_events_endpoint", "tcp://localhost:5557"))
+                kv_topic = str(extra.get("kv_events_topic", ""))
+                self._kv_events_subscriber = KVEventsSubscriber(
+                    umbp_client=self.client,
+                    endpoint=kv_endpoint,
+                    topic=kv_topic,
+                    dp_rank=_dp_rank if _is_dp_mode else None,
+                )
+                self._kv_events_subscriber.start()
 
     # ------------------------------------------------------------------
     # Host memory pool registration
@@ -860,11 +867,14 @@ class KVEventsSubscriber:
         endpoint: str = "tcp://localhost:5557",
         topic: str = "",
         poll_timeout_ms: int = 100,
+        dp_rank: Optional[int] = None,
     ) -> None:
         self._umbp_client = umbp_client
         self._endpoint = endpoint
         self._topic = topic
         self._poll_timeout_ms = poll_timeout_ms
+        # When set, only process events whose attn_dp_rank matches (DP mode).
+        self._dp_rank = dp_rank
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         # Track reported hashes so AllBlocksCleared can revoke them all.
@@ -943,6 +953,11 @@ class KVEventsSubscriber:
             BlockRemoved,
             BlockStored,
         )
+
+        if self._dp_rank is not None:
+            event_dp_rank = attn_dp_rank if attn_dp_rank is not None else 0
+            if event_dp_rank != self._dp_rank:
+                return
 
         if isinstance(event, BlockStored):
             hashes = [str(h) for h in event.block_hashes]
