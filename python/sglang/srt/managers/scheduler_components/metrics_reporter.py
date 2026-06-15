@@ -648,7 +648,10 @@ class SchedulerMetricsReporter:
             self._update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
-            self.scheduler.kv_events_publisher.emit_kv_metrics()
+            # NOTE: disabled - emit_kv_metrics() does a blocking PUSH send on a
+            # socket with no consumer (metrics_ipc_name is unbound), which
+            # deadlocks DP-attention prefill on the first real batch.
+            # self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
 
     def report_decode_stats(
@@ -862,7 +865,10 @@ class SchedulerMetricsReporter:
             self._update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
-            self.scheduler.kv_events_publisher.emit_kv_metrics()
+            # NOTE: disabled - emit_kv_metrics() does a blocking PUSH send on a
+            # socket with no consumer (metrics_ipc_name is unbound), which
+            # deadlocks DP-attention prefill on the first real batch.
+            # self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
 
     def log_batch_result_stats(

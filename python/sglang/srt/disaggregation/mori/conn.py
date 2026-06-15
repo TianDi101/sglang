@@ -459,6 +459,24 @@ class MoriKVManager(CommonKVManager):
         except Exception:
             logger.exception("Failed to parse transfer info message")
 
+    def _handle_abort_message(self, msg: List[bytes]) -> None:
+        """Decode-side abort notification: mark the room Failed so the prefill
+        sender stops transferring and the room gets cleaned up. Mirrors the
+        Mooncake backend; the raw ``b"ABORT"`` frame is sent by
+        CommonKVReceiver._send_abort_notification (no MORI_GUARD prefix)."""
+        try:
+            room = int(msg[1].decode("ascii"))
+        except (IndexError, ValueError):
+            logger.warning("Received malformed abort message")
+            return
+        if (
+            room in self.request_status
+            and self.check_status(room) != KVPoll.Success
+        ):
+            self.record_failure(room, "Aborted by decode")
+            self.update_status(room, KVPoll.Failed)
+            logger.debug("Marked room %s Failed via decode abort notification", room)
+
     def _validate_message(self, msg: List[bytes]) -> Optional[List[bytes]]:
         if not msg or msg[0] != MORI_GUARD:
             logger.warning("Received malformed bootstrap message")
@@ -473,6 +491,9 @@ class MoriKVManager(CommonKVManager):
             while True:
                 try:
                     msg = self.server_socket.recv_multipart()
+                    if msg and msg[0] == b"ABORT":
+                        self._handle_abort_message(msg)
+                        continue
                     payload = self._validate_message(msg)
                     if payload is None:
                         continue
