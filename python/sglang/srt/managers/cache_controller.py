@@ -476,13 +476,26 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if (
+            use_zero_copy = (
                 self.storage_backend_type
                 in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori"]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
+            )
+
+            # UMBP (mori) zero-copy requires a page_first-family layout where a
+            # page is one contiguous region. The layer_first host layout (forced
+            # on ROCm + kernel io backend) stripes a page across layers, so fall
+            # back to the flat non-zero-copy path, which gathers each page into a
+            # contiguous tensor before storing it.
+            if (
+                self.storage_backend_type == "mori"
+                and self.mem_pool_host.layout == "layer_first"
             ):
+                use_zero_copy = False
+
+            if use_zero_copy:
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
 

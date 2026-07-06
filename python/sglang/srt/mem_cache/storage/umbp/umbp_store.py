@@ -787,6 +787,11 @@ class UMBPStore(HiCacheStorage):
                 safe_cap = int(cfg.ssd.capacity_bytes * 0.95)
                 cfg.ssd.spdk_proxy_tenant_quota_bytes = max(1, safe_cap // dp_size_hint)
 
+        # Flat (non-zero-copy) mode is selected in register_mem_pool_host based
+        # on the host layout; default False so batch ops work even when no
+        # mem_pool_host is registered.
+        self._flat_mode = False
+
         self.client = UMBPClient(cfg)
         if mem_pool_host is not None:
             self.register_mem_pool_host(mem_pool_host)
@@ -865,7 +870,29 @@ class UMBPStore(HiCacheStorage):
             "page_first",
             "page_first_direct",
             "page_head",
-        ], "UMBP store only supports page_first, page_first_direct, or page_head layout"
+            "layer_first",
+        ], (
+            "UMBP store only supports page_first, page_first_direct, page_head "
+            "(zero-copy) or layer_first (flat, non-zero-copy) layout"
+        )
+
+        # layer_first pages are striped across layers and cannot be transferred
+        # as one contiguous zero-copy region per page. Use the flat
+        # (non-zero-copy) path: the controller gathers each page into a
+        # contiguous tensor via get_data_page()/set_from_flat_data_page() and we
+        # store it under a single key per page. The controller must route
+        # layer_first to _generic_page_get/_set (see CacheController).
+        self._flat_mode = self.mem_pool_host.layout == "layer_first"
+        if (
+            self._flat_mode
+            and self.storage_config
+            and self.storage_config.should_split_heads
+        ):
+            raise ValueError(
+                "UMBP flat (layer_first) mode does not support heterogeneous-TP "
+                "head splitting (should_split_heads); use a page_first-family "
+                "layout for that configuration."
+            )
 
         # In distributed mode, pre-register the entire host KV buffer with the
         # underlying RDMA IOEngine so PoolClient can take the zero-copy path
@@ -1114,10 +1141,24 @@ class UMBPStore(HiCacheStorage):
         )
         return self._batch_postprocess(put_results, is_set_operate=True)
 
+    def _flat_key(self, key: str) -> str:
+        """One key per page for the flat (non-zero-copy / layer_first) path.
+
+        The whole (K+V) page is a single contiguous blob, so there is no _k/_v
+        (or per-layer _l{L}) split. This is a distinct key namespace from the
+        zero-copy path — a pool must be written and read by the same path.
+        """
+        suffix = self.mla_suffix if self.is_mla_backend else self.mha_suffix
+        return f"{key}_{suffix}"
+
     def batch_exists(
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
         """Return count of consecutive existing keys from start."""
+        if self._flat_mode:
+            # One key per page → consecutive hit count is the page count.
+            query_keys = [self._flat_key(key) for key in keys]
+            return self.client.batch_exists_consecutive(query_keys)
         if self.is_mla_backend:
             query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
             key_multiplier = 1
@@ -1157,7 +1198,23 @@ class UMBPStore(HiCacheStorage):
         keys: List[str],
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
-    ) -> int:
+    ):
+        if self._flat_mode:
+            # Flat path used by CacheController._generic_page_get:
+            #   target_locations = list of contiguous flat page tensors to fill.
+            # Return a list where entry i is the filled tensor on hit, else None
+            # (the controller stops at the first None).
+            if not keys:
+                return []
+            assert target_locations is not None and len(keys) == len(
+                target_locations
+            )
+            key_strs = [self._flat_key(k) for k in keys]
+            ptrs = [int(t.data_ptr()) for t in target_locations]
+            sizes = [int(t.numel() * t.element_size()) for t in target_locations]
+            results = self.client.batch_get_into_ptr(key_strs, ptrs, sizes)
+            return [t if ok else None for t, ok in zip(target_locations, results)]
+
         if not keys:
             return 0
         assert len(keys) == len(target_locations) == len(target_sizes)
@@ -1195,6 +1252,17 @@ class UMBPStore(HiCacheStorage):
             return False
         if self.is_mla_follower:
             return True
+        if self._flat_mode:
+            # Flat path used by CacheController._generic_page_set:
+            #   values = list of contiguous flat page tensors (get_data_page()).
+            # One key per page → one put per page (the layer gather already
+            # happened upstream in get_data_page().flatten()).
+            assert values is not None and len(keys) == len(values)
+            key_strs = [self._flat_key(k) for k in keys]
+            ptrs = [int(v.data_ptr()) for v in values]
+            sizes = [int(v.numel() * v.element_size()) for v in values]
+            results = self.client.batch_put_from_ptr(key_strs, ptrs, sizes)
+            return all(results)
         assert len(keys) == len(target_locations) == len(target_sizes)
         results = self.client.batch_put_from_ptr(
             keys,
