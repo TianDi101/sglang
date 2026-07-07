@@ -383,7 +383,7 @@ class HiMambaRadixCache(MambaRadixCache):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
-                for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+                for _, finish_event, ack_list, _ in self.cache_controller.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
                         backuped_node = self.ongoing_write_through.pop(ack_id)
@@ -401,7 +401,7 @@ class HiMambaRadixCache(MambaRadixCache):
         # independently (no cross-rank sync).
         finish_count = 0
         if len(self.ongoing_write_through) > 0:
-            for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+            for _, finish_event, ack_list, _ in self.cache_controller.ack_write_queue:
                 if not finish_event.query():
                     break
                 finish_count += 1
@@ -416,7 +416,7 @@ class HiMambaRadixCache(MambaRadixCache):
         finish_count = int(queue_size.item())
 
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
+            _, finish_event, ack_list, _ = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
@@ -430,7 +430,7 @@ class HiMambaRadixCache(MambaRadixCache):
         # Every rank must enter the all_reduce below; ongoing_load_back can
         # diverge across ranks.
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
+        for _, finish_event, ack_list, _ in self.cache_controller.ack_load_queue:
             if not finish_event.query():
                 break
             finish_count += 1
@@ -445,7 +445,7 @@ class HiMambaRadixCache(MambaRadixCache):
         finish_count = int(queue_size.item())
 
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
+            _, finish_event, ack_list, _ = self.cache_controller.ack_load_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
                 end_node = self.ongoing_load_back.pop(ack_id)

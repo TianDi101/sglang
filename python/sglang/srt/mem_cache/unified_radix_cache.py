@@ -2339,7 +2339,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if write_back:
             # Blocking: wait for all pending write-backs
             while self.ongoing_write_through:
-                for _, finish_event, ack_list in cc.ack_write_queue:
+                for _, finish_event, ack_list, _ in cc.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
                         if ack_id in self.ongoing_write_through:
@@ -2352,7 +2352,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # diverge across ranks (e.g. write_backup returning 0 on a subset).
         finish_count = 0
         if self.pp_rank == 0:
-            for _, finish_event, ack_list in cc.ack_write_queue:
+            for _, finish_event, ack_list, _ in cc.ack_write_queue:
                 if not finish_event.query():
                     break
                 finish_count += 1
@@ -2363,7 +2363,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Process completed acks
         while finish_count > 0:
-            _, finish_event, ack_list = cc.ack_write_queue.pop(0)
+            _, finish_event, ack_list, _ = cc.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
                 self._finish_write_through_ack(ack_id)
@@ -2378,7 +2378,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # diverge across ranks.
         finish_count = 0
         if self.pp_rank == 0:
-            for _, finish_event, ack_list in cc.ack_load_queue:
+            for _, finish_event, ack_list, _ in cc.ack_load_queue:
                 if not finish_event.query():
                     break
                 finish_count += 1
@@ -2387,7 +2387,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         finish_count = finish_count_tensor.item()
 
         while finish_count > 0:
-            _, finish_event, ack_list = cc.ack_load_queue.pop(0)
+            _, finish_event, ack_list, _ = cc.ack_load_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)

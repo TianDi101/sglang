@@ -408,8 +408,8 @@ class HybridCacheController(BaseHiCacheController):
                 self.move_hybrid_indices(op)
             )
         self.write_queue.clear()
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
+        start_event = device_module.Event(enable_timing=True)
+        finish_event = device_module.Event(enable_timing=True)
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
@@ -434,7 +434,9 @@ class HybridCacheController(BaseHiCacheController):
                 device_indices,
                 resolved_pool_transfers,
             )
-        self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+        self.ack_write_queue.append(
+            HiCacheAck(start_event, finish_event, op.node_ids, len(device_indices))
+        )
 
     def load(
         self,
@@ -525,6 +527,7 @@ class HybridCacheController(BaseHiCacheController):
                 producer_event.start_event,
                 producer_event.finish_event,
                 op.node_ids,
+                len(device_indices),
             )
         )
         return producer_id
