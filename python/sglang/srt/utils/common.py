@@ -1713,10 +1713,25 @@ def add_prometheus_track_response_middleware(app):
 def _get_fastapi_request_path(request) -> Tuple[str, bool]:
     from starlette.routing import Match
 
+    def _resolve_path(route) -> Optional[str]:
+        match, _ = route.matches(request.scope)
+        if match != Match.FULL:
+            return None
+        if hasattr(route, "path"):
+            return route.path
+        # Newer FastAPI versions may lazily group an `include_router()` call
+        # behind a single top-level entry (e.g. `_IncludedRouter`) that has no
+        # `.path` of its own; resolve the actual matched leaf route instead.
+        for child in route.effective_route_contexts():
+            path = _resolve_path(child)
+            if path is not None:
+                return path
+        return None
+
     for route in request.app.routes:
-        match, child_scope = route.matches(request.scope)
-        if match == Match.FULL:
-            return route.path, True
+        path = _resolve_path(route)
+        if path is not None:
+            return path, True
 
     return request.url.path, False
 
