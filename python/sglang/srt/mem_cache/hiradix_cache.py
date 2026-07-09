@@ -1406,7 +1406,7 @@ class HiRadixCache(RadixCache):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
     ) -> int:
-        if not self.enable_storage or self.cache_controller.prefetch_rate_limited():
+        if not self.enable_storage:
             return 0
 
         prefetch_key = RadixKey(
@@ -1415,6 +1415,16 @@ class HiRadixCache(RadixCache):
             is_bigram=self.is_eagle,
         ).page_aligned(self.page_size)
         if len(prefetch_key) < self.prefetch_threshold:
+            return 0
+
+        if self.cache_controller.prefetch_rate_limited():
+            logger.info(
+                "HiCache prefetch rate limited, dropping storage-hit query tokens=%d pages=%d occupied=%d limit=%d",
+                len(prefetch_key),
+                len(prefetch_key) // self.page_size,
+                self.cache_controller.prefetch_tokens_occupied,
+                self.cache_controller.prefetch_capacity_limit,
+            )
             return 0
 
         prefetch_op_cls = (
@@ -1665,11 +1675,17 @@ class HiRadixCache(RadixCache):
         # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
-        if (
-            not self.enable_storage
-            or prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
-        ):
+        if not self.enable_storage or prefetch_length < self.prefetch_threshold:
+            return
+        if self.cache_controller.prefetch_rate_limited():
+            logger.info(
+                "HiCache prefetch rate limited, dropping req=%s tokens=%d pages=%d occupied=%d limit=%d",
+                req_id,
+                prefetch_length,
+                prefetch_length // self.page_size,
+                self.cache_controller.prefetch_tokens_occupied,
+                self.cache_controller.prefetch_capacity_limit,
+            )
             return
 
         last_host_node.protect_host()

@@ -1737,11 +1737,17 @@ class HiMambaRadixCache(MambaRadixCache):
             len(new_input_tokens) % self.page_size
         )
         new_input_tokens = new_input_tokens[:prefetch_length]
-        if (
-            not self.enable_storage
-            or prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
-        ):
+        if not self.enable_storage or prefetch_length < self.prefetch_threshold:
+            return
+        if self.cache_controller.prefetch_rate_limited():
+            logger.info(
+                "HiCache prefetch rate limited, dropping req=%s tokens=%d pages=%d occupied=%d limit=%d",
+                req_id,
+                prefetch_length,
+                prefetch_length // self.page_size,
+                self.cache_controller.prefetch_tokens_occupied,
+                self.cache_controller.prefetch_capacity_limit,
+            )
             return
 
         self._protect_host_node(last_host_node, protect_mamba=False)
