@@ -1568,7 +1568,13 @@ class HiRadixCache(RadixCache):
             return False
 
         if self.enable_storage_metrics and self.prefetch_stop_policy == "wait_complete":
-            stall_ms = (time.monotonic() - operation.start_time) * 1000
+            # completed_time is stamped by the prefetch IO thread the instant
+            # the transfer actually stops; only externally aborted operations
+            # (which skip the IO thread) fall back to the poll-time now().
+            completed_time = operation.completed_time
+            if completed_time is None:
+                completed_time = time.monotonic()
+            stall_ms = (completed_time - operation.start_time) * 1000
             self.storage_metrics_collector.log_prefetch_wait_stall_ms(stall_ms)
 
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(

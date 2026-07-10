@@ -129,6 +129,10 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
+        # Stamped by the prefetch IO thread once this operation (KV pages
+        # plus any extra pool transfers) has actually stopped progressing,
+        # not when some other thread next polls it.
+        self.completed_time: Optional[float] = None
         super().__init__(
             host_indices,
             token_ids,
@@ -657,6 +661,10 @@ class HybridCacheController(BaseHiCacheController):
             results = self.storage_backend.batch_get_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
         operation.pool_transfers_done = True
+        # Overwrite the KV-only timestamp from super(): completion for this
+        # operation also requires pool_transfers_done, so the real "stopped
+        # progressing" event is here, not inside the base-class KV loop.
+        operation.completed_time = time.monotonic()
 
     def _page_backup(self, operation):
         # Backup extra pools

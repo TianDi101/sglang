@@ -197,6 +197,11 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
+        # Stamped by the prefetch IO thread the instant it stops actively
+        # transferring this operation (success or failure), so downstream
+        # stall metrics reflect the real completion event rather than the
+        # next time some other thread happens to poll this operation.
+        self.completed_time: Optional[float] = None
 
         super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
 
@@ -996,6 +1001,8 @@ class HiCacheController:
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
+
+        operation.completed_time = time.monotonic()
 
     def prefetch_io_aux_func(self):
         """
