@@ -1,7 +1,10 @@
+import logging
 import os
 from typing import List, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 def is_hip() -> bool:
@@ -9,23 +12,34 @@ def is_hip() -> bool:
 
 
 _is_hip = is_hip()
+_logged_mla_block_quota = False
 
 
 def _default_mla_block_quota() -> int:
-    """CU (block) quota for the MLA page_first KV gather kernel.
+    """CU (block) quota for the MLA KV transfer kernels (per-layer and all-layer).
 
     Defaults to 16 on ROCm / 2 on CUDA. Override with the
     SGLANG_HICACHE_BLOCK_QUOTA environment variable to tune how many CUs the
     kernel is launched with.
     """
+    global _logged_mla_block_quota
     default = 16 if _is_hip else 2
     override = os.environ.get("SGLANG_HICACHE_BLOCK_QUOTA")
     if override is None:
-        return default
-    try:
-        return int(override)
-    except ValueError:
-        return default
+        quota = default
+    else:
+        try:
+            quota = int(override)
+        except ValueError:
+            quota = default
+
+    if not _logged_mla_block_quota:
+        logger.info(
+            f"MLA KV transfer kernel block_quota={quota} "
+            f"(platform_default={default}, SGLANG_HICACHE_BLOCK_QUOTA={override!r})"
+        )
+        _logged_mla_block_quota = True
+    return quota
 
 
 def transfer_kv_per_layer(
@@ -290,9 +304,11 @@ def transfer_kv_all_layer_mla(
     dst_indices: torch.Tensor,
     item_size: int,
     num_layers: int,
-    block_quota: int = 2,
+    block_quota: Optional[int] = None,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
+    if block_quota is None:
+        block_quota = _default_mla_block_quota()
     torch.ops.sgl_kernel.transfer_kv_all_layer_mla.default(
         src_layers,
         dst_layers,
@@ -313,9 +329,11 @@ def transfer_kv_all_layer_mla_lf_pf(
     item_size: int,
     dst_layout_dim: int,
     num_layers: int,
-    block_quota: int = 2,
+    block_quota: Optional[int] = None,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
+    if block_quota is None:
+        block_quota = _default_mla_block_quota()
     torch.ops.sgl_kernel.transfer_kv_all_layer_mla_lf_pf.default(
         src_layers,
         dst,

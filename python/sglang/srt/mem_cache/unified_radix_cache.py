@@ -2020,6 +2020,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not self.can_terminate_prefetch(operation):
             return False
 
+        if (
+            self.enable_storage_metrics
+            and self.storage_metrics_collector is not None
+            and self.prefetch_stop_policy == "wait_complete"
+        ):
+            stall_ms = (time.monotonic() - operation.start_time) * 1000
+            self.storage_metrics_collector.log_prefetch_wait_stall_ms(stall_ms)
+
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )

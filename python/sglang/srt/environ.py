@@ -432,6 +432,12 @@ class Envs:
     SGLANG_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
 
     # Hi-Cache
+    # CU/block quota for the JIT HiCache L2<->L1 (host<->device) transfer
+    # kernels in sglang.jit_kernel.hicache. Unset uses each kernel's built-in
+    # default. Note this is a *separate* knob from the sgl-kernel MLA transfer
+    # path (sgl_kernel.kvcacheio reads the same env var name directly, since
+    # sgl-kernel is a standalone package that cannot depend on this module).
+    SGLANG_HICACHE_BLOCK_QUOTA = EnvInt(None)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)

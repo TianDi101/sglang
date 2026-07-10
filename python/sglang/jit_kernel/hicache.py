@@ -5,12 +5,26 @@ from typing import TYPE_CHECKING
 
 from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     import torch
     from tvm_ffi.module import Module
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_BLOCK_QUOTA = 2
+
+
+def _default_block_quota() -> int:
+    """CU (block) quota for the JIT HiCache L2<->L1 transfer kernels.
+
+    Falls back to DEFAULT_BLOCK_QUOTA unless overridden via the
+    SGLANG_HICACHE_BLOCK_QUOTA environment variable (shared with the
+    sgl-kernel MLA transfer path's block_quota knob).
+    """
+    override = envs.SGLANG_HICACHE_BLOCK_QUOTA.get()
+    return override if override is not None else DEFAULT_BLOCK_QUOTA
 
 
 @cache_once
@@ -21,7 +35,7 @@ def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> 
         block_quota,
         1024,  # num_threads, can be tuned for performance
     )
-    return load_jit(
+    module = load_jit(
         "hicache",
         *args,
         cuda_files=[
@@ -34,6 +48,11 @@ def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> 
             ("launch_all_mla", f"&HiCacheKernel<{args}>::run_all_mla"),
         ],
     )
+    logger.info(
+        f"HiCache JIT kernel compiled with block_quota={block_quota} "
+        f"(element_size={element_size}, unroll={unroll})"
+    )
+    return module
 
 
 @cache_once
@@ -46,7 +65,7 @@ def _jit_hicache_staged_module(
         block_quota,
         1024,  # num_threads, kept for template compatibility
     )
-    return load_jit(
+    module = load_jit(
         "hicache_staged",
         *args,
         cuda_files=[
@@ -63,6 +82,11 @@ def _jit_hicache_staged_module(
             ),
         ],
     )
+    logger.info(
+        f"HiCache staged JIT kernel compiled with block_quota={block_quota} "
+        f"(element_size={element_size}, unroll={unroll})"
+    )
+    return module
 
 
 def can_use_hicache_jit_kernel(
@@ -71,13 +95,12 @@ def can_use_hicache_jit_kernel(
     unroll: int | None = None,  # can be tuned for performance
     block_quota: int | None = None,  # can be tuned for less interference
 ) -> bool:
-    logger = logging.getLogger(__name__)
     if element_size % 128 != 0:
         logger.warning(f"Unsupported {element_size = } for JIT HiCache kernel")
         return False
     try:
         unroll = unroll or _default_unroll(element_size)
-        block_quota = block_quota or DEFAULT_BLOCK_QUOTA
+        block_quota = block_quota or _default_block_quota()
         _jit_hicache_module(
             element_size=element_size,
             unroll=unroll,
@@ -95,13 +118,12 @@ def can_use_write_back_jit_kernel(
     unroll: int | None = None,  # can be tuned for performance
     block_quota: int | None = None,  # can be tuned for less interference
 ) -> bool:
-    logger = logging.getLogger(__name__)
     if element_size % 16 != 0:
         logger.warning(f"Unsupported {element_size = } for staged JIT HiCache kernel")
         return False
     try:
         unroll = unroll or _default_unroll(element_size)
-        block_quota = block_quota or DEFAULT_BLOCK_QUOTA
+        block_quota = block_quota or _default_block_quota()
         _jit_hicache_staged_module(
             element_size=element_size,
             unroll=unroll,
@@ -143,7 +165,7 @@ def transfer_hicache_one_layer(
     k_cache_dst = k_cache_dst.view(-1, element_dim)
     v_cache_dst = v_cache_dst.view(-1, element_dim)
     element_size = element_dim * k_cache_dst.element_size()
-    block_quota = block_quota or DEFAULT_BLOCK_QUOTA
+    block_quota = block_quota or _default_block_quota()
     unroll = unroll or _default_unroll(element_size)
     module = _jit_hicache_module(
         element_size=element_size,
@@ -179,7 +201,7 @@ def transfer_hicache_all_layer(
         assert kv_cache_dst_stride_bytes == kv_cache_src_stride_bytes
         element_size = kv_cache_dst_stride_bytes
 
-    block_quota = block_quota or DEFAULT_BLOCK_QUOTA
+    block_quota = block_quota or _default_block_quota()
     unroll = unroll or _default_unroll(element_size)
     module = _jit_hicache_module(
         element_size=element_size,
@@ -212,7 +234,7 @@ def transfer_hicache_one_layer_mla(
     cache_src = cache_src.view(-1, element_dim)
     cache_dst = cache_dst.view(-1, element_dim)
     element_size = element_dim * cache_dst.element_size()
-    block_quota = block_quota or DEFAULT_BLOCK_QUOTA
+    block_quota = block_quota or _default_block_quota()
     unroll = unroll or _default_unroll(element_size)
     module = _jit_hicache_module(
         element_size=element_size,
@@ -243,7 +265,7 @@ def transfer_hicache_all_layer_mla(
         assert cache_dst_stride_bytes == cache_src_stride_bytes
         element_size = cache_dst_stride_bytes
 
-    block_quota = block_quota or DEFAULT_BLOCK_QUOTA
+    block_quota = block_quota or _default_block_quota()
     unroll = unroll or _default_unroll(element_size)
     module = _jit_hicache_module(
         element_size=element_size,
@@ -278,7 +300,7 @@ def transfer_hicache_all_layer_staged_lf_pf(
 ) -> None:
     element_dim = staging_k[0, 0].numel()
     element_size = element_size or (element_dim * staging_k.element_size())
-    block_quota = block_quota or DEFAULT_BLOCK_QUOTA
+    block_quota = block_quota or _default_block_quota()
     unroll = unroll or _default_unroll(element_size)
     src_page_indices = src_indices[::page_size].contiguous()
     module = _jit_hicache_staged_module(
@@ -324,7 +346,7 @@ def transfer_hicache_all_layer_mla_staged_lf_pf(
 ) -> None:
     element_dim = staging[0, 0].numel()
     element_size = element_size or (element_dim * staging.element_size())
-    block_quota = block_quota or DEFAULT_BLOCK_QUOTA
+    block_quota = block_quota or _default_block_quota()
     unroll = unroll or _default_unroll(element_size)
     src_page_indices = src_indices[::page_size].contiguous()
     module = _jit_hicache_staged_module(

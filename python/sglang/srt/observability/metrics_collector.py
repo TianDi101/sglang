@@ -1865,6 +1865,20 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_bandwidth,
         )
 
+        self.prefetch_wait_stall_ms = Histogram(
+            name="sglang:prefetch_wait_stall_ms",
+            documentation=(
+                "Histogram of time (ms) a request was blocked waiting for its "
+                "L3->L2 prefetch to fully complete under the wait_complete "
+                "hicache_storage_prefetch_policy."
+            ),
+            labelnames=labels.keys(),
+            buckets=(1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000),
+        )
+
+    def log_prefetch_wait_stall_ms(self, stall_ms: float):
+        self.prefetch_wait_stall_ms.labels(**self.labels).observe(stall_ms)
+
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
