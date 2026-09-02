@@ -4160,14 +4160,6 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
-        if self.enable_unified_cache_external_linker:
-            # Only now have the requests marked above run their own
-            # cache_finished_req and let go of the chains the failed load
-            # published, so the tree can finally drop them. A mid-chunk abort
-            # is deferred to process_pending_chunked_abort, so its chain is
-            # still held here; purge_failed_linker_nodes retries those.
-            self.tree_cache.purge_failed_linker_nodes()
-
         self._record_step_counters(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)

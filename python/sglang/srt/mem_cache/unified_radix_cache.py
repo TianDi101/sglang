@@ -102,11 +102,6 @@ from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 T = TypeVar("T")
 
-# A poisoned chain stays held until the aborting request runs its own
-# cache_finished_req: the same step for a normal abort, the next one for a
-# mid-chunk abort, so purge_failed_linker_nodes retries before giving up.
-_PURGE_ATTEMPTS = 4
-
 # Metric label per component, matching the host pool names used by
 # hicache_backup_tokens_total and the host occupancy gauges.
 _COMPONENT_POOL_LABEL = {
@@ -250,10 +245,6 @@ class UnifiedRadixCache(BasePrefixCache):
         # Requests whose external-linker load failed, awaiting the scheduler's
         # abort. Drained by drain_linker_loads().
         self._failed_linker_rids: list[str] = []
-        # Poisoned chains whose drop declined because the aborted request had
-        # not released them yet, keyed by node id -> attempts left. A mid-chunk
-        # abort is deferred a step, so one pass is not always enough.
-        self._pending_purge_nodes: dict[NodeId, int] = {}
         # Buffer-only host memory mode (host RAM as transient GPU↔storage
         # staging, not an L2 tier); resolved in init_hicache, which also
         # constructs the pipeline collaborator (None = cache mode).
@@ -360,9 +351,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def reset(self) -> None:
         if self.linker is not None:
             self.linker.reset()
-        # The tree these referred to is about to go; nothing left to purge.
+        # The tree these referred to is about to go; nothing left to reclaim.
         self._failed_linker_rids.clear()
-        self._pending_purge_nodes.clear()
         self._reset_full()
 
     def _reset_full(self) -> None:
@@ -841,6 +831,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
+            # release_session has run the tree-lock release this needs.
+            self._reclaim_failed_linker_chain(req.rid)
             return
 
         if self.disable:
@@ -912,6 +904,9 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+        # The lock this request held on a failed load's chain is gone now, and
+        # a path-unlock dropped it on every node of the chain at once.
+        self._reclaim_failed_linker_chain(req.rid)
 
         if is_insert and result is not None and result.last_device_node is not None:
             req.last_node = result.last_device_node
@@ -2819,39 +2814,39 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self._failed_linker_rids.extend(failed)
 
-    def purge_failed_linker_nodes(self) -> None:
-        """Drop the tree chains a failed load published.
+    def _reclaim_failed_linker_chain(self, rid: str) -> None:
+        """Free the tree chain a failed external-linker load published for rid.
 
-        Must run after the affected requests have released their locks, which
-        is what their own cache_finished_req does, so this belongs after the
-        result processing that finishes them -- not before it.
+        Called from cache_finished_req once the request has dropped its tree
+        lock, which is the one point where the whole chain becomes
+        reclaimable: Full is a path-unlock, so that single dec_lock_ref clears
+        lock_ref on every node of the chain at once. A mid-chunk abort reaches
+        the same function later, through process_pending_chunked_abort.
+
+        Endpoint-first, because a parent only becomes a device leaf once its
+        child is gone.
+
+        A node something else still owns -- a request that matched the chain
+        before the load failed, a host copy, an in-flight DMA -- is left where
+        it is. It stays detached, so it can be neither matched nor written to
+        the store, and it keeps its LRU membership, so eviction reclaims it.
+        Retrying here would only poll for a release with no step bound.
         """
         if self.linker is None:
             return
-        pending = self._pending_purge_nodes
-        for node_id in self.linker.take_poisoned_nodes():
-            pending.setdefault(node_id, _PURGE_ATTEMPTS)
-        if not pending:
-            return
-        self._pending_purge_nodes = {}
-        for node_id, attempts_left in pending.items():
+        stranded: list[NodeId] = []
+        for node_id in self.linker.take_failed_chain(rid):
             result = self.tree_core.invalidate_external_load_chain(node_id)
             self._free_values(result.device_frees, result.host_frees)
-            if result.is_dropped:
-                continue
-            if attempts_left > 1:
-                # Still held by the request that is aborting over it.
-                self._pending_purge_nodes[node_id] = attempts_left - 1
-                continue
-            # Something else still owns the chain. It was detached at mark
-            # time, so it is unreachable and can be neither matched nor written
-            # to the store; giving up here only defers reclaiming its slots to
-            # eviction, which reaches it because it stays on the LRU lists.
+            if not result.is_dropped:
+                stranded.append(node_id)
+        if stranded:
             logger.warning(
-                "Failed external-linker chain at node %d is still owned "
-                "elsewhere; detached, so it cannot be matched -- its slots are "
-                "left to eviction",
-                node_id,
+                "Failed external-linker chain of %s is still owned elsewhere "
+                "at nodes %s; detached, so it cannot be matched -- its slots "
+                "are left to eviction",
+                rid,
+                stranded,
             )
 
     def ready_to_load_host_cache(self) -> int:

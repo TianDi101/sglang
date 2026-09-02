@@ -171,10 +171,11 @@ class UnifiedCacheLinkerWrapper:
         # completes. The anchor is the request's node before the load, so a
         # failed load can walk back exactly the chain it published.
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams, NodeId]] = {}
-        # Endpoints of chains published by a load that then failed. They hold
-        # no valid KV, so the cache drops them once the aborted requests have
-        # let go of their locks.
-        self.poisoned_nodes: list[NodeId] = []
+        # rid -> the chain a failed load published for it, endpoint-first.
+        # The nodes hold no valid KV and are already cut out of the tree; the
+        # cache frees them in that request's own cache_finished_req, which is
+        # where its lock on them goes.
+        self.failed_chains: dict[str, list[NodeId]] = {}
         # Load batches popped by take_completed_loads and awaiting the reduced
         # verdict in commit_completed_loads.
         self.taken_loads: list[tuple[list[str], bool]] = []
@@ -562,9 +563,9 @@ class UnifiedCacheLinkerWrapper:
     def commit_completed_loads(self, successes: Sequence[bool]) -> list[str]:
         """Apply the reduced verdict; return the rids of the failed batches.
 
-        A failed chain is marked poisoned, which keeps its unfilled pages out
-        of the store. The nodes themselves go once the requests reading them
-        have released their locks.
+        A failed chain is cut out of the tree and filed under its rid, which
+        keeps its unfilled pages out of the store and out of every walk. The
+        nodes themselves go when that request runs its own cache_finished_req.
         """
         assert len(successes) <= len(self.taken_loads)
         failed: list[str] = []
@@ -577,12 +578,12 @@ class UnifiedCacheLinkerWrapper:
                     continue
                 node_id, lock_params, anchor = entry
                 if not success:
-                    self._mark_poisoned(node_id, anchor)
+                    self._detach_failed_chain(rid, node_id, anchor)
                     failed.append(rid)
                 self.cache.dec_lock_ref(node_id, lock_params)
         return failed
 
-    def _mark_poisoned(self, node_id: NodeId, anchor: NodeId) -> None:
+    def _detach_failed_chain(self, rid: str, node_id: NodeId, anchor: NodeId) -> None:
         """Cut the chain this load published out of the tree, endpoint first.
 
         ``external_cache_stored`` is left alone: the chain really did come from
@@ -592,23 +593,27 @@ class UnifiedCacheLinkerWrapper:
         Detaching, rather than only flagging, is what keeps the chain from
         being served: match_prefix does not read ``poisoned``, so a flagged
         chain stayed matchable until the purge managed to drop it, and the
-        first request that matched it gave it a device child and blocked that
-        purge for good.
+        first request that matched it gave it a device child and blocked the
+        reclaim for good.
 
-        The whole chain is handed to the purge, not just its endpoint. Deleting
-        the endpoint does not cascade: ``_iteratively_delete_tombstone_leaf``
-        stops at the first ancestor still holding a device value, and every
-        node this load just filled has one. Endpoint-first order matters too --
-        a parent only becomes a device leaf once its child is gone.
+        The whole chain is filed, not just its endpoint. Deleting the endpoint
+        does not cascade: ``_iteratively_delete_tombstone_leaf`` stops at the
+        first ancestor still holding a device value, and every node this load
+        just filled has one. Endpoint-first order matters too -- a parent only
+        becomes a device leaf once its child is gone.
+
+        Filed under the rid because that request's ``cache_finished_req`` is
+        the one point where the whole chain becomes reclaimable: Full is a
+        path-unlock, so its single ``dec_lock_ref`` drops ``lock_ref`` on every
+        node of the chain at once.
         """
-        self.poisoned_nodes.extend(
+        self.failed_chains.setdefault(rid, []).extend(
             self.cache.tree_core.detach_external_load_chain(node_id, anchor)
         )
 
-    def take_poisoned_nodes(self) -> list[NodeId]:
-        nodes = self.poisoned_nodes
-        self.poisoned_nodes = []
-        return nodes
+    def take_failed_chain(self, rid: str) -> list[NodeId]:
+        """Pop the chain filed for this rid, if a load failed for it."""
+        return self.failed_chains.pop(rid, [])
 
     def take_completed_offloads(self, finish_count: int) -> list[bool]:
         assert finish_count <= len(self.pending_offloads)
@@ -634,10 +639,12 @@ class UnifiedCacheLinkerWrapper:
             self.cache.dec_lock_ref(node_id, lock_params)
         self.pending_loads.clear()
         self.pending_offloads.clear()
-        self.poisoned_nodes.clear()
+        self.failed_chains.clear()
         self.taken_loads.clear()
 
     def release_request(self, rid: str) -> None:
+        # failed_chains is deliberately untouched: the chain outlives the
+        # request's linker state, and cache_finished_req is what frees it.
         self.hit_markers.pop(rid, None)
         # Only a load that has not started can be cancelled here. One already
         # in flight keeps its pending_loads entry and its lock until

@@ -153,7 +153,7 @@ def _make_wrapper(completions, chain_len=3):
     wrapper.hit_markers = {}
     wrapper.pending_loads = {}
     wrapper.pending_offloads = []
-    wrapper.poisoned_nodes = []
+    wrapper.failed_chains = {}
     wrapper.taken_loads = []
     return wrapper
 
@@ -194,8 +194,8 @@ class TestUnifiedCacheLinkerLoadFailure(CustomTestCase):
         self.assertTrue(wrapper.cache.nodes[2].poisoned)
         self.assertTrue(wrapper.cache.nodes[1].poisoned)
         self.assertFalse(wrapper.cache.nodes[0].poisoned)
-        self.assertEqual(wrapper.take_poisoned_nodes(), [2, 1])
-        self.assertEqual(wrapper.take_poisoned_nodes(), [])
+        self.assertEqual(wrapper.take_failed_chain("rid-a"), [2, 1])
+        self.assertEqual(wrapper.take_failed_chain("rid-a"), [])
 
     def test_successful_batch_reports_nothing_and_keeps_the_chain(self):
         wrapper = _make_wrapper([(["rid-a"], True)])
@@ -207,7 +207,7 @@ class TestUnifiedCacheLinkerLoadFailure(CustomTestCase):
         self.assertEqual(wrapper.cache.locks, 0)
         self.assertTrue(wrapper.cache.nodes[2].external_cache_stored)
         self.assertFalse(wrapper.cache.nodes[2].poisoned)
-        self.assertEqual(wrapper.poisoned_nodes, [])
+        self.assertEqual(wrapper.failed_chains, {})
 
     def test_drain_tolerates_a_request_released_while_queued(self):
         """release_request cancels an unstarted load; its rid still comes back."""
@@ -234,7 +234,7 @@ class TestUnifiedCacheLinkerLoadFailure(CustomTestCase):
         self.assertEqual(wrapper.cache.locks, 1)
         self.assertEqual(wrapper.pending_loads.keys(), {"rid-a"})
         self.assertFalse(wrapper.cache.nodes[2].poisoned)
-        self.assertEqual(wrapper.poisoned_nodes, [])
+        self.assertEqual(wrapper.failed_chains, {})
 
     def test_commit_honours_a_verdict_the_rank_did_not_reach_itself(self):
         """A rank whose own get succeeded must still abort when a peer's failed.
@@ -253,7 +253,7 @@ class TestUnifiedCacheLinkerLoadFailure(CustomTestCase):
         self.assertEqual(failed, ["rid-a"])
         self.assertEqual(wrapper.cache.locks, 0)
         self.assertTrue(wrapper.cache.nodes[2].poisoned)
-        self.assertEqual(wrapper.take_poisoned_nodes(), [2, 1])
+        self.assertEqual(wrapper.take_failed_chain("rid-a"), [2, 1])
 
     def test_commit_keeps_a_chain_when_the_group_agrees_it_landed(self):
         wrapper = _make_wrapper([(["rid-a"], True)])
@@ -263,7 +263,7 @@ class TestUnifiedCacheLinkerLoadFailure(CustomTestCase):
         self.assertEqual(wrapper.commit_completed_loads([True]), [])
         self.assertTrue(wrapper.cache.nodes[2].external_cache_stored)
         self.assertFalse(wrapper.cache.nodes[2].poisoned)
-        self.assertEqual(wrapper.poisoned_nodes, [])
+        self.assertEqual(wrapper.failed_chains, {})
 
     def test_reset_drops_batches_taken_but_never_committed(self):
         wrapper = _make_wrapper([(["rid-a"], False)])
@@ -525,7 +525,7 @@ class TestSchedulerMarkHook(CustomTestCase):
     def test_suppresses_the_radix_insert_of_the_unloaded_tail(self):
         # The eventual release_kv_cache defaults to is_insert=True. Without
         # this the unloaded pages go back into the tree, and they also pin the
-        # chain purge_failed_linker_nodes has to drop.
+        # chain cache_finished_req has to free.
         req = self._make_req("rid-a")
 
         self._run(["rid-a"], [req])
@@ -596,16 +596,23 @@ class TestSchedulerMarkHook(CustomTestCase):
         self.assertEqual(scheduler._deferred_linker_rids, {"rid-gone"})
 
 
-class TestPurgeFailedLinkerNodes(CustomTestCase):
-    """The purge runs after the aborts, and retries a chain still held."""
+class TestReclaimFailedLinkerChain(CustomTestCase):
+    """The reclaim is keyed by rid and fires once, at the release point.
 
-    def _cache(self, poisoned, drop_results):
+    ``cache_finished_req`` is the one place where the whole chain becomes
+    reclaimable: Full is a path-unlock, so the request's single
+    ``dec_lock_ref`` clears ``lock_ref`` on every node of the chain at once.
+    Nothing polls, so there is no attempt budget to tune -- a chain someone
+    else still owns is left to eviction, which reaches it because detaching
+    kept its LRU membership.
+    """
+
+    def _cache(self, chains, drop_results):
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.linker = MagicMock()
-        cache.linker.take_poisoned_nodes.side_effect = [list(poisoned)] + [[]] * 8
-        cache._pending_purge_nodes = {}
+        cache.linker.take_failed_chain.side_effect = lambda rid: chains.pop(rid, [])
         cache._free_values = MagicMock()
 
         attempts = []
@@ -622,41 +629,77 @@ class TestPurgeFailedLinkerNodes(CustomTestCase):
         cache.tree_core.invalidate_external_load_chain.side_effect = invalidate
         return cache, attempts
 
-    def test_drops_a_released_chain_on_the_first_pass(self):
-        cache, attempts = self._cache([7], [True])
+    def test_frees_the_whole_chain_endpoint_first(self):
+        # Deleting the endpoint does not cascade, and a parent only becomes a
+        # device leaf once its child is gone.
+        cache, attempts = self._cache({"rid-a": [3, 2, 1]}, [True] * 3)
 
-        cache.purge_failed_linker_nodes()
+        cache._reclaim_failed_linker_chain("rid-a")
 
-        self.assertEqual(attempts, [7])
-        self.assertEqual(cache._pending_purge_nodes, {})
+        self.assertEqual(attempts, [3, 2, 1])
+        self.assertEqual(cache._free_values.call_count, 3)
 
-    def test_retries_a_chain_the_aborting_request_still_holds(self):
-        # A mid-chunk abort is deferred to process_pending_chunked_abort, so
-        # the request has not run cache_finished_req yet and the drop declines.
-        cache, attempts = self._cache([7], [False, True])
+    def test_a_request_with_no_failed_load_touches_the_tree_not_at_all(self):
+        cache, attempts = self._cache({}, [])
 
-        cache.purge_failed_linker_nodes()
-        self.assertEqual(cache._pending_purge_nodes, {7: 3})
-
-        cache.purge_failed_linker_nodes()
-        self.assertEqual(attempts, [7, 7])
-        self.assertEqual(cache._pending_purge_nodes, {})
-
-    def test_gives_up_on_a_chain_another_request_adopted(self):
-        cache, attempts = self._cache([7], [False] * 4)
-
-        for _ in range(4):
-            cache.purge_failed_linker_nodes()
-
-        self.assertEqual(attempts, [7, 7, 7, 7])
-        self.assertEqual(cache._pending_purge_nodes, {})
-
-    def test_no_poisoned_nodes_touches_the_tree_not_at_all(self):
-        cache, attempts = self._cache([], [])
-
-        cache.purge_failed_linker_nodes()
+        cache._reclaim_failed_linker_chain("rid-a")
 
         self.assertEqual(attempts, [])
+
+    def test_another_rid_reclaims_nothing(self):
+        cache, attempts = self._cache({"rid-a": [1]}, [True])
+
+        cache._reclaim_failed_linker_chain("rid-b")
+
+        self.assertEqual(attempts, [])
+
+    def test_a_chain_someone_else_owns_is_left_to_eviction(self):
+        # Declining must not schedule a retry: the remaining owners -- a
+        # request that matched the chain before the load failed, a host copy,
+        # an in-flight DMA -- release on no step bound, and eviction already
+        # reaches a detached node.
+        cache, attempts = self._cache({"rid-a": [1]}, [False])
+
+        cache._reclaim_failed_linker_chain("rid-a")
+        cache._reclaim_failed_linker_chain("rid-a")
+
+        self.assertEqual(attempts, [1], "the reclaim polled instead of giving up")
+
+
+class TestCacheFinishedReqReclaimsAfterTheUnlock(CustomTestCase):
+    """The wiring: the reclaim runs, and runs after the tree lock is dropped.
+
+    Freeing before ``_dec_req_lock`` would decline on every node -- the
+    request still owns them -- and the chain would silently fall through to
+    eviction on every abort.
+    """
+
+    def _cache(self, order):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.session = MagicMock()
+        cache.session.try_cache_finished_req.return_value = False
+        cache.disable = False
+        cache.enable_session_radix_cache = False
+        cache._components_tuple = ()
+        cache.req_to_token_pool = MagicMock()
+        cache.token_to_kv_pool_allocator = MagicMock()
+        cache._dec_req_lock = lambda req, skip_swa=False: order.append("unlock")
+        cache._reclaim_failed_linker_chain = lambda rid: order.append(rid)
+        return cache
+
+    def test_the_reclaim_follows_the_unlock(self):
+        order = []
+        req = MagicMock()
+        req.rid = "rid-a"
+        req.origin_input_ids = [1, 2]
+        req.output_ids = []
+        req.cache_protected_len = 0
+
+        self._cache(order).cache_finished_req(req, is_insert=False, kv_len_to_handle=2)
+
+        self.assertEqual(order, ["unlock", "rid-a"])
 
 
 class TestPoisonedChainNeverReachesTheStore(CustomTestCase):
@@ -747,14 +790,14 @@ class TestPoisonIsRefusedByTheTree(CustomTestCase):
 class TestPoisonCoversEveryNodeOfTheChain(CustomTestCase):
     """B2. A load's insert can span several nodes, and all of them are bad.
 
-    ``_mark_poisoned`` already walks ``endpoint -> anchor``; the purge only ever
-    received the endpoint. Deleting the endpoint does **not** cascade through
+    ``_detach_failed_chain`` already walks ``endpoint -> anchor``; the reclaim
+    only ever received the endpoint. Deleting the endpoint does **not** cascade through
     the rest: ``_iteratively_delete_tombstone_leaf`` stops at the first ancestor
     that still holds a device value, and every node the load just filled has
     one. So the intermediate nodes survived -- matchable, and offload-eligible.
     """
 
-    def test_every_published_node_is_handed_to_the_purge(self):
+    def test_every_published_node_is_filed_for_the_reclaim(self):
         wrapper = _make_wrapper([(["rid-a"], False)], chain_len=4)
         wrapper._queue_load("rid-a", 3, ["transfer"], anchor=0)
 
@@ -762,7 +805,7 @@ class TestPoisonCoversEveryNodeOfTheChain(CustomTestCase):
 
         # Deepest first: the parent only becomes a device leaf once its child
         # is gone, so purging root-ward would decline on every node but one.
-        self.assertEqual(wrapper.take_poisoned_nodes(), [3, 2, 1])
+        self.assertEqual(wrapper.take_failed_chain("rid-a"), [3, 2, 1])
 
     def test_a_single_node_chain_still_publishes_exactly_that_node(self):
         wrapper = _make_wrapper([(["rid-a"], False)], chain_len=2)
@@ -770,7 +813,7 @@ class TestPoisonCoversEveryNodeOfTheChain(CustomTestCase):
 
         _drain(wrapper, 1)
 
-        self.assertEqual(wrapper.take_poisoned_nodes(), [1])
+        self.assertEqual(wrapper.take_failed_chain("rid-a"), [1])
 
 
 class TestSchedulerDefersUnmatchedRids(CustomTestCase):
@@ -944,7 +987,7 @@ class TestPoisonedChainIsCutOutOfTheTree(CustomTestCase):
     """The tree side of B1, closed by detaching instead of flagging.
 
     ``match_prefix`` never consulted ``poisoned``, so a failed load's chain
-    stayed reachable until the purge managed to drop it -- and the first
+    stayed reachable until the reclaim managed to drop it -- and the first
     request that matched it gave the chain a device child, which is one of the
     conditions ``invalidate_external_load_chain`` declines on. So matching the
     chain once pinned it in the tree permanently: every later request with that
@@ -986,8 +1029,8 @@ class TestPoisonedChainIsCutOutOfTheTree(CustomTestCase):
             self.assertTrue(wrapper.cache.nodes[node_id].detached, node_id)
         self.assertFalse(wrapper.cache.nodes[0].detached, "anchor must stay")
 
-    def test_the_chain_keeps_its_own_links_for_the_purge(self):
-        """Only the top link is cut; the purge still walks the chain."""
+    def test_the_chain_keeps_its_own_links_for_the_reclaim(self):
+        """Only the top link is cut; the reclaim still walks the chain."""
         wrapper = _make_wrapper([(["rid-a"], False)], chain_len=4)
         wrapper._queue_load("rid-a", 3, ["transfer"], anchor=0)
 
@@ -1095,7 +1138,7 @@ class TestFreeingADetachedChain(CustomTestCase):
         self.assertEqual(core._detached_roots, {})
 
     def test_freeing_it_never_evicts_a_node_that_took_its_place(self):
-        """The anchor's child slot is reusable, and reuse must survive the purge.
+        """The anchor's child slot is reusable, and reuse must survive the reclaim.
 
         This is the whole point of detaching: a later request with the same
         tokens builds a fresh node under the anchor. Popping the key blind when
