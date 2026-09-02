@@ -94,6 +94,9 @@ class LayerWiseLoadCounter:
         self._producer_index = -1
         self.consumer_index = -1
         self._futures: dict[int, list[Future]] = {}
+        # Batch indices whose failure has already been logged, so a 60-layer
+        # model reports one line per failed load rather than sixty.
+        self._reported: set[int] = set()
 
     def update_producer(self) -> int:
         self._producer_index += 1
@@ -107,9 +110,16 @@ class LayerWiseLoadCounter:
         self._futures[index][layer].set_result(None)
 
     def fail(self, index: int, error: BaseException) -> None:
+        # Publish a private, message-preserving copy rather than the caller's
+        # own exception: wait_until clears the traceback of whatever it catches
+        # (see there), and the caller still needs its exception intact for the
+        # logger.exception() that follows this call. On its own this copy fixes
+        # nothing -- a traceback is not inherited from construction, it is
+        # rebuilt by every raise -- so it only works together with that clear.
+        failure = RuntimeError(f"{type(error).__name__}: {error}")
         for future in self._futures.get(index, ()):
             if not future.done():
-                future.set_exception(error)
+                future.set_exception(failure)
 
     def wait_until(self, threshold: int) -> None:
         index = self.consumer_index
@@ -119,15 +129,42 @@ class LayerWiseLoadCounter:
         try:
             futures[threshold].result()
         except BaseException as error:
-            raise RuntimeError("UMBP layer-wise KV load failed.") from error
+            # Never raise here: this runs inside the model forward, where an
+            # exception reaches no handler before the scheduler's top-level
+            # one and takes the whole engine down. The batch proceeds over
+            # unloaded pages and the linker reports the failure through
+            # pop_completed_load(), which aborts the affected requests before
+            # their output is committed.
+            if index not in self._reported:
+                self._reported.add(index)
+                logger.error(
+                    "UMBP layer-wise KV load failed for batch %d; affected "
+                    "requests will be aborted after this forward: %s",
+                    index,
+                    error,
+                )
+            # Drop the traceback this raise just appended. One exception
+            # object is shared by every layer's future, so each layer's
+            # re-raise adds another entry to it, and every entry roots a frame
+            # chain reaching that layer's forward frame -- pinning that layer's
+            # activations. A 61-layer model then held one full activation set
+            # per layer: +31.9 GiB on a single faulted forward at
+            # --chunked-prefill-size 2048 (~133 GiB at 8192), and consecutive
+            # failures stacked until the engine OOMed inside the attention
+            # kernel. Nothing needs the traceback -- the message is logged
+            # above, and the failure verdict travels through
+            # pop_completed_load().
+            error.__traceback__ = None
         finally:
             if threshold == self.num_layers - 1:
                 self._futures.pop(index, None)
+                self._reported.discard(index)
 
     def reset(self) -> None:
         self._producer_index = -1
         self.consumer_index = -1
         self._futures.clear()
+        self._reported.clear()
 
 
 @dataclass
@@ -366,7 +403,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
         self._pending: dict[str, list[PoolTransfer]] = {}
         self._gc_frozen = False
-        self._load_queue: Queue[tuple[int, list[_PoolRangePlan]] | None] = Queue()
+        self._load_queue: Queue[tuple[int, list[str], list[_PoolRangePlan]] | None] = (
+            Queue()
+        )
+        # (rids, success) per started load batch. Pushed from a finally so a
+        # failed batch still releases the tree-side locks it pinned.
+        self._completed_loads: Queue[tuple[list[str], bool]] = Queue()
         self._offload_queue: Queue[tuple[list[PoolTransfer], object] | None] = Queue()
         self._offload_results: Queue[bool] = Queue()
         self._offload_sync_groups = _drain_sync_groups(params)
@@ -557,9 +599,19 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._pending = {}
         plans = self._build_load_plans(list(pending.values()))
         counter_index = self.layer_done_counter.update_producer()
-        self._load_queue.put((counter_index, plans))
+        self._load_queue.put((counter_index, list(pending), plans))
         self._stats["load"] += len(pending)
         return counter_index
+
+    def cancel_queued_load(self, rid: str) -> bool:
+        return self._pending.pop(rid, None) is not None
+
+    def num_completed_loads(self) -> int:
+        # The tree agrees on the drain count across ranks before calling pop.
+        return self._completed_loads.qsize()
+
+    def pop_completed_load(self) -> tuple[list[str], bool]:
+        return self._completed_loads.get_nowait()
 
     def _build_load_plans(
         self,
@@ -713,8 +765,14 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, plans = task
-                self._run_layer_wise_batch(counter_index, plans)
+                counter_index, rids, plans = task
+                success = False
+                try:
+                    success = self._run_layer_wise_batch(counter_index, plans)
+                finally:
+                    # In a finally so the tree always gets its batch back and
+                    # can release the node locks the load pinned.
+                    self._completed_loads.put((rids, success))
             finally:
                 self._load_queue.task_done()
 
@@ -791,7 +849,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
 
     def _run_layer_wise_batch(
         self, counter_index: int, plans: list[_PoolRangePlan]
-    ) -> None:
+    ) -> bool:
         try:
             by_layer: dict[int, list[_PoolRangePlan]] = defaultdict(list)
             for plan in plans:
@@ -832,9 +890,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 # granularity for fewer times each object is named on the wire.
                 for logical_layer in group:
                     self.layer_done_counter.complete(counter_index, logical_layer)
+            return True
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("UMBP layer-wise load batch failed")
+            return False
 
     def _layer_groups(self) -> list[list[int]]:
         return [
@@ -1145,11 +1205,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._load_queue.join()
         self._offload_queue.join()
         self._clear_extkv()
-        while True:
-            try:
-                self._offload_results.get_nowait()
-            except Empty:
-                break
+        for queue in (self._offload_results, self._completed_loads):
+            while True:
+                try:
+                    queue.get_nowait()
+                except Empty:
+                    break
         self.layer_done_counter.reset()
 
     def close(self) -> None:

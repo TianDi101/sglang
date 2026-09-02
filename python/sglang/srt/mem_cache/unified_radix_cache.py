@@ -102,6 +102,11 @@ from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 T = TypeVar("T")
 
+# A poisoned chain stays held until the aborting request runs its own
+# cache_finished_req: the same step for a normal abort, the next one for a
+# mid-chunk abort, so purge_failed_linker_nodes retries before giving up.
+_PURGE_ATTEMPTS = 4
+
 # Metric label per component, matching the host pool names used by
 # hicache_backup_tokens_total and the host occupancy gauges.
 _COMPONENT_POOL_LABEL = {
@@ -242,6 +247,13 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
+        # Requests whose external-linker load failed, awaiting the scheduler's
+        # abort. Drained by drain_linker_loads().
+        self._failed_linker_rids: list[str] = []
+        # Poisoned chains whose drop declined because the aborted request had
+        # not released them yet, keyed by node id -> attempts left. A mid-chunk
+        # abort is deferred a step, so one pass is not always enough.
+        self._pending_purge_nodes: dict[NodeId, int] = {}
         # Buffer-only host memory mode (host RAM as transient GPU↔storage
         # staging, not an L2 tier); resolved in init_hicache, which also
         # constructs the pipeline collaborator (None = cache mode).
@@ -348,6 +360,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def reset(self) -> None:
         if self.linker is not None:
             self.linker.reset()
+        # The tree these referred to is about to go; nothing left to purge.
+        self._failed_linker_rids.clear()
+        self._pending_purge_nodes.clear()
         self._reset_full()
 
     def _reset_full(self) -> None:
@@ -2692,7 +2707,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
             load_count, offload_count = map(int, finish_counts.tolist())
-            self.linker.drain_loads(load_count)
+            self._collect_failed_linker_loads(load_count)
             local_successes = self.linker.take_completed_offloads(offload_count)
             if local_successes:
                 successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
@@ -2759,6 +2774,85 @@ class UnifiedRadixCache(BasePrefixCache):
                 storage_metrics = StorageMetrics()
             storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+
+    def drain_linker_loads(self) -> list[str]:
+        """Retire finished linker loads and return the rids that must abort.
+
+        The batch count is MIN-reduced first because a load failure is
+        rank-local: unreduced, one rank aborts a request the others keep.
+        """
+        if self.linker is None:
+            return []
+        finish_count = torch.tensor(
+            [self.linker.num_completed_loads()], dtype=torch.int, device="cpu"
+        )
+        self._all_reduce_attn_groups(finish_count, torch.distributed.ReduceOp.MIN)
+        self._collect_failed_linker_loads(int(finish_count[0].item()))
+        failed = self._failed_linker_rids
+        self._failed_linker_rids = []
+        return failed
+
+    def _collect_failed_linker_loads(self, finish_count: int) -> None:
+        if finish_count <= 0:
+            return
+        # The verdict has to agree across the attention group, not just the
+        # batch count. A load failure is rank-local: acting on the local
+        # verdict aborts the request on the ranks that saw the failure while
+        # the rest serve it, and the rank owning the output stream commits
+        # output over KV that never arrived. finish_count is already reduced,
+        # so every rank builds a tensor of the same length here.
+        local_successes = self.linker.take_completed_loads(finish_count)
+        successes = torch.tensor(
+            [int(success) for success in local_successes],
+            dtype=torch.int,
+            device="cpu",
+        )
+        self._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
+        failed = self.linker.commit_completed_loads(
+            [bool(success) for success in successes.tolist()]
+        )
+        if failed:
+            logger.error(
+                "External linker load failed for %d request(s); aborting them: %s",
+                len(failed),
+                failed,
+            )
+            self._failed_linker_rids.extend(failed)
+
+    def purge_failed_linker_nodes(self) -> None:
+        """Drop the tree chains a failed load published.
+
+        Must run after the affected requests have released their locks, which
+        is what their own cache_finished_req does, so this belongs after the
+        result processing that finishes them -- not before it.
+        """
+        if self.linker is None:
+            return
+        pending = self._pending_purge_nodes
+        for node_id in self.linker.take_poisoned_nodes():
+            pending.setdefault(node_id, _PURGE_ATTEMPTS)
+        if not pending:
+            return
+        self._pending_purge_nodes = {}
+        for node_id, attempts_left in pending.items():
+            result = self.tree_core.invalidate_external_load_chain(node_id)
+            self._free_values(result.device_frees, result.host_frees)
+            if result.is_dropped:
+                continue
+            if attempts_left > 1:
+                # Still held by the request that is aborting over it.
+                self._pending_purge_nodes[node_id] = attempts_left - 1
+                continue
+            # Something else still owns the chain. It was detached at mark
+            # time, so it is unreachable and can be neither matched nor written
+            # to the store; giving up here only defers reclaiming its slots to
+            # eviction, which reaches it because it stays on the LRU lists.
+            logger.warning(
+                "Failed external-linker chain at node %d is still owned "
+                "elsewhere; detached, so it cannot be matched -- its slots are "
+                "left to eviction",
+                node_id,
+            )
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""

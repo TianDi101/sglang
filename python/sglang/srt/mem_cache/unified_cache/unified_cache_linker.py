@@ -90,8 +90,15 @@ class UnifiedCacheLinker(ABC):
         """Return the number of completed load batches waiting to be consumed."""
 
     @abstractmethod
-    def pop_completed_load(self) -> list[str]:
-        """Consume the oldest completed load batch and return its request IDs."""
+    def pop_completed_load(self) -> tuple[list[str], bool]:
+        """Consume the oldest completed load batch.
+
+        Returns its request IDs and whether every transfer in it landed. A
+        failed batch must still be reported here, not raised, so the tree can
+        release the locks it pinned and abort the requests that were reading
+        it. Failure is per batch, not per request: the plans are merged, so
+        one bad key costs every request in the batch its hit.
+        """
 
     @abstractmethod
     def offload(self, transfers: list[PoolTransfer]) -> bool:
@@ -160,8 +167,17 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
-        # Loads in flight, each pinning its inserted endpoint until DMA completes.
-        self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
+        # Loads in flight, each pinning its inserted endpoint until DMA
+        # completes. The anchor is the request's node before the load, so a
+        # failed load can walk back exactly the chain it published.
+        self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams, NodeId]] = {}
+        # Endpoints of chains published by a load that then failed. They hold
+        # no valid KV, so the cache drops them once the aborted requests have
+        # let go of their locks.
+        self.poisoned_nodes: list[NodeId] = []
+        # Load batches popped by take_completed_loads and awaiting the reduced
+        # verdict in commit_completed_loads.
+        self.taken_loads: list[tuple[list[str], bool]] = []
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[tuple[NodeId, DecLockRefParams]] = []
 
@@ -358,16 +374,23 @@ class UnifiedCacheLinkerWrapper:
             canonical_full=canonical_tail,
         )
 
-        self._queue_load(req.rid, insert_result.last_device_node, load_transfers)
+        anchor = req.last_node
+        self._queue_load(
+            req.rid, insert_result.last_device_node, load_transfers, anchor=anchor
+        )
 
         node = cache.resolve_node_handle(insert_result.last_device_node)
-        while node.id != req.last_node:
+        while node.id != anchor:
             node.external_cache_stored = True
             node = node.parent
         return canonical_tail, insert_result.last_device_node
 
     def _queue_load(
-        self, rid: str, node_id: NodeId, transfers: list[PoolTransfer]
+        self,
+        rid: str,
+        node_id: NodeId,
+        transfers: list[PoolTransfer],
+        anchor: NodeId,
     ) -> None:
         if not transfers:
             return
@@ -381,7 +404,7 @@ class UnifiedCacheLinkerWrapper:
         if not queued:
             self.cache.dec_lock_ref(node_id, lock_params)
             raise RuntimeError(f"Failed to queue the linker load for rid={rid!r}.")
-        self.pending_loads[rid] = (node_id, lock_params)
+        self.pending_loads[rid] = (node_id, lock_params, anchor)
 
     def _update_load(
         self,
@@ -476,9 +499,15 @@ class UnifiedCacheLinkerWrapper:
     # ---- offload: device -> remote, driven by the write-through chain ----
 
     def offload_nodes(self, node_ids: Sequence[NodeId]) -> None:
-        """Persist a write-through chain, skipping nodes already in the store."""
+        """Persist a write-through chain.
+
+        Skips nodes the store already has, and nodes a failed load poisoned --
+        those hold no KV, and writing them would put corruption in the store
+        under the legitimate content hash for that token sequence.
+        """
         for node_id in node_ids:
-            if not self.cache.resolve_node_handle(node_id).external_cache_stored:
+            node = self.cache.resolve_node_handle(node_id)
+            if not node.external_cache_stored and not node.poisoned:
                 self._offload_node(node_id)
 
     def _offload_node(self, node_id: NodeId) -> None:
@@ -513,11 +542,73 @@ class UnifiedCacheLinkerWrapper:
     def num_completed_loads(self) -> int:
         return self.cache_linker.num_completed_loads()
 
-    def drain_loads(self, finish_count: int) -> None:
-        for _ in range(finish_count):
-            for rid in self.cache_linker.pop_completed_load():
-                node_id, lock_params = self.pending_loads.pop(rid)
+    def take_completed_loads(self, finish_count: int) -> list[bool]:
+        """Pop finished load batches, reporting the local verdict only.
+
+        Split from the commit half so the caller can MIN-reduce the verdict
+        across the attention group first. A load failure is rank-local -- one
+        rank's batch_get can miss a key the others read fine -- so a rank that
+        poisons and aborts on its own verdict diverges from the ranks that do
+        not: the request is aborted on some ranks and served on the rest, and
+        the rank owning the output stream emits KV that never arrived.
+
+        This mirrors take_completed_offloads / commit_completed_offloads, which
+        already reduce their verdict for the same reason.
+        """
+        taken = [self.cache_linker.pop_completed_load() for _ in range(finish_count)]
+        self.taken_loads.extend(taken)
+        return [success for _rids, success in taken]
+
+    def commit_completed_loads(self, successes: Sequence[bool]) -> list[str]:
+        """Apply the reduced verdict; return the rids of the failed batches.
+
+        A failed chain is marked poisoned, which keeps its unfilled pages out
+        of the store. The nodes themselves go once the requests reading them
+        have released their locks.
+        """
+        assert len(successes) <= len(self.taken_loads)
+        failed: list[str] = []
+        for success in successes:
+            rids, _local_success = self.taken_loads.pop(0)
+            for rid in rids:
+                entry = self.pending_loads.pop(rid, None)
+                if entry is None:
+                    # Released early by release_request while queued.
+                    continue
+                node_id, lock_params, anchor = entry
+                if not success:
+                    self._mark_poisoned(node_id, anchor)
+                    failed.append(rid)
                 self.cache.dec_lock_ref(node_id, lock_params)
+        return failed
+
+    def _mark_poisoned(self, node_id: NodeId, anchor: NodeId) -> None:
+        """Cut the chain this load published out of the tree, endpoint first.
+
+        ``external_cache_stored`` is left alone: the chain really did come from
+        the store, and clearing it is what makes the unfilled pages eligible
+        for write-through -- the opposite of what is wanted.
+
+        Detaching, rather than only flagging, is what keeps the chain from
+        being served: match_prefix does not read ``poisoned``, so a flagged
+        chain stayed matchable until the purge managed to drop it, and the
+        first request that matched it gave it a device child and blocked that
+        purge for good.
+
+        The whole chain is handed to the purge, not just its endpoint. Deleting
+        the endpoint does not cascade: ``_iteratively_delete_tombstone_leaf``
+        stops at the first ancestor still holding a device value, and every
+        node this load just filled has one. Endpoint-first order matters too --
+        a parent only becomes a device leaf once its child is gone.
+        """
+        self.poisoned_nodes.extend(
+            self.cache.tree_core.detach_external_load_chain(node_id, anchor)
+        )
+
+    def take_poisoned_nodes(self) -> list[NodeId]:
+        nodes = self.poisoned_nodes
+        self.poisoned_nodes = []
+        return nodes
 
     def take_completed_offloads(self, finish_count: int) -> list[bool]:
         assert finish_count <= len(self.pending_offloads)
@@ -539,15 +630,21 @@ class UnifiedCacheLinkerWrapper:
     def reset(self) -> None:
         self.cache_linker.reset()
         self.hit_markers.clear()
-        for node_id, lock_params in self.pending_loads.values():
+        for node_id, lock_params, _anchor in self.pending_loads.values():
             self.cache.dec_lock_ref(node_id, lock_params)
         self.pending_loads.clear()
         self.pending_offloads.clear()
+        self.poisoned_nodes.clear()
+        self.taken_loads.clear()
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        # Only a load that has not started can be cancelled here. One already
+        # in flight keeps its pending_loads entry and its lock until
+        # commit_completed_loads retires the batch, which the linkers guarantee
+        # happens even when the transfer fails.
         if self.cache_linker.cancel_queued_load(rid):
-            node_id, lock_params = self.pending_loads.pop(rid)
+            node_id, lock_params, _anchor = self.pending_loads.pop(rid)
             self.cache.dec_lock_ref(node_id, lock_params)
 
     def close(self) -> None:
