@@ -84,7 +84,6 @@ class FakeNode:
         self.id = node_id
         self.parent = parent
         self.external_cache_stored = True
-        self.poisoned = False
         self.detached = False
         self.key = FakeKey(node_id)
         self.children = {}
@@ -182,7 +181,7 @@ class TestUnifiedCacheLinkerLoadFailure(CustomTestCase):
         self.assertEqual(wrapper.cache.locks, 0)
         self.assertEqual(wrapper.pending_loads, {})
 
-    def test_failed_batch_poisons_the_chain_it_published(self):
+    def test_failed_batch_detaches_the_chain_it_published(self):
         """The published chain must never be offloaded back into the store."""
         wrapper = _make_wrapper([(["rid-a"], False)])
         wrapper._queue_load("rid-a", 2, ["transfer"], anchor=0)
@@ -191,9 +190,9 @@ class TestUnifiedCacheLinkerLoadFailure(CustomTestCase):
 
         # Nodes 1 and 2 were published by this load; node 0 is the anchor the
         # request already had, and must be left alone.
-        self.assertTrue(wrapper.cache.nodes[2].poisoned)
-        self.assertTrue(wrapper.cache.nodes[1].poisoned)
-        self.assertFalse(wrapper.cache.nodes[0].poisoned)
+        self.assertTrue(wrapper.cache.nodes[2].detached)
+        self.assertTrue(wrapper.cache.nodes[1].detached)
+        self.assertFalse(wrapper.cache.nodes[0].detached)
         self.assertEqual(wrapper.take_failed_chain("rid-a"), [2, 1])
         self.assertEqual(wrapper.take_failed_chain("rid-a"), [])
 
@@ -206,7 +205,7 @@ class TestUnifiedCacheLinkerLoadFailure(CustomTestCase):
         self.assertEqual(failed, [])
         self.assertEqual(wrapper.cache.locks, 0)
         self.assertTrue(wrapper.cache.nodes[2].external_cache_stored)
-        self.assertFalse(wrapper.cache.nodes[2].poisoned)
+        self.assertFalse(wrapper.cache.nodes[2].detached)
         self.assertEqual(wrapper.failed_chains, {})
 
     def test_drain_tolerates_a_request_released_while_queued(self):
@@ -223,17 +222,17 @@ class TestUnifiedCacheLinkerLoadFailure(CustomTestCase):
         self.assertEqual(wrapper.cache.locks, 0)
 
     def test_take_reports_the_local_verdict_without_touching_the_tree(self):
-        """take must not poison or unlock -- the verdict is not final yet."""
+        """take must not detach or unlock -- the verdict is not final yet."""
         wrapper = _make_wrapper([(["rid-a"], False)])
         wrapper._queue_load("rid-a", 2, ["transfer"], anchor=0)
 
         successes = wrapper.take_completed_loads(1)
 
         self.assertEqual(successes, [False])
-        # Still pinned and still unpoisoned until commit applies the verdict.
+        # Still pinned and still on the tree until commit applies the verdict.
         self.assertEqual(wrapper.cache.locks, 1)
         self.assertEqual(wrapper.pending_loads.keys(), {"rid-a"})
-        self.assertFalse(wrapper.cache.nodes[2].poisoned)
+        self.assertFalse(wrapper.cache.nodes[2].detached)
         self.assertEqual(wrapper.failed_chains, {})
 
     def test_commit_honours_a_verdict_the_rank_did_not_reach_itself(self):
@@ -252,7 +251,7 @@ class TestUnifiedCacheLinkerLoadFailure(CustomTestCase):
 
         self.assertEqual(failed, ["rid-a"])
         self.assertEqual(wrapper.cache.locks, 0)
-        self.assertTrue(wrapper.cache.nodes[2].poisoned)
+        self.assertTrue(wrapper.cache.nodes[2].detached)
         self.assertEqual(wrapper.take_failed_chain("rid-a"), [2, 1])
 
     def test_commit_keeps_a_chain_when_the_group_agrees_it_landed(self):
@@ -262,7 +261,7 @@ class TestUnifiedCacheLinkerLoadFailure(CustomTestCase):
         self.assertEqual(wrapper.take_completed_loads(1), [True])
         self.assertEqual(wrapper.commit_completed_loads([True]), [])
         self.assertTrue(wrapper.cache.nodes[2].external_cache_stored)
-        self.assertFalse(wrapper.cache.nodes[2].poisoned)
+        self.assertFalse(wrapper.cache.nodes[2].detached)
         self.assertEqual(wrapper.failed_chains, {})
 
     def test_reset_drops_batches_taken_but_never_committed(self):
@@ -702,7 +701,7 @@ class TestCacheFinishedReqReclaimsAfterTheUnlock(CustomTestCase):
         self.assertEqual(order, ["unlock", "rid-a"])
 
 
-class TestPoisonedChainNeverReachesTheStore(CustomTestCase):
+class TestFailedChainNeverReachesTheStore(CustomTestCase):
     """B1. A chain published by a failed load must not be offloaded.
 
     ``load_back`` sets ``external_cache_stored = True`` on the chain because
@@ -712,16 +711,20 @@ class TestPoisonedChainNeverReachesTheStore(CustomTestCase):
     be written into the store, where the corruption outlives a ``/flush_cache``
     and reaches every node sharing the tier.
 
-    One boolean cannot mean absent / present / **invalid**, so poison gets its
-    own state and ``external_cache_stored`` keeps meaning what its name says.
+    The chain is cut out of the tree instead, so no root-anchored walk can
+    name it for write-through in the first place. Both write-through paths
+    assert on that rather than testing it: one of these nodes turning up on a
+    walk means the tree is corrupt, and the write is the least of the
+    problems.
     """
 
-    def test_a_failed_chain_is_never_offloaded(self):
+    def test_offloading_a_failed_chain_fails_loudly(self):
         wrapper = _make_wrapper([(["rid-a"], False)])
         wrapper._queue_load("rid-a", 2, ["transfer"], anchor=0)
         _drain(wrapper, 1)
 
-        wrapper.offload_nodes([2, 1])
+        with self.assertRaises(AssertionError):
+            wrapper.offload_nodes([2, 1])
 
         self.assertEqual(wrapper.cache_linker.offloaded, [])
         self.assertEqual(wrapper.pending_offloads, [])
@@ -735,12 +738,12 @@ class TestPoisonedChainNeverReachesTheStore(CustomTestCase):
 
         for node_id in (1, 2):
             self.assertTrue(wrapper.cache.nodes[node_id].external_cache_stored)
-            self.assertTrue(wrapper.cache.nodes[node_id].poisoned)
+            self.assertTrue(wrapper.cache.nodes[node_id].detached)
         # The anchor was the request's own node, not part of this load.
-        self.assertFalse(wrapper.cache.nodes[0].poisoned)
+        self.assertFalse(wrapper.cache.nodes[0].detached)
 
     def test_an_ordinary_unstored_node_still_offloads(self):
-        """The refusal must be poison-specific, not a blanket one."""
+        """The refusal must be detach-specific, not a blanket one."""
         wrapper = _make_wrapper([])
         wrapper.cache.nodes[1].external_cache_stored = False
 
@@ -749,11 +752,12 @@ class TestPoisonedChainNeverReachesTheStore(CustomTestCase):
         self.assertEqual(len(wrapper.cache_linker.offloaded), 1)
 
 
-class TestPoisonIsRefusedByTheTree(CustomTestCase):
-    """B1, tree side: write-through must decline a poisoned node.
+class TestDetachedNodeIsRefusedByTheTree(CustomTestCase):
+    """B1, tree side: write-through must not fire for a detached node.
 
-    Match is deliberately *not* taught to refuse one here -- see the note on
-    ``UnifiedTreeNode.poisoned``.
+    Match is deliberately *not* taught to refuse one -- see the note on
+    ``UnifiedTreeNode.detached``. The insert walk cannot reach a detached
+    node either, so this is an assert, not a skip.
     """
 
     def _core(self, **overrides):
@@ -769,8 +773,9 @@ class TestPoisonIsRefusedByTheTree(CustomTestCase):
 
     def _node(self, **overrides):
         node = SimpleNamespace(
+            id=7,
             evicted=False,
-            poisoned=False,
+            detached=False,
             external_cache_stored=False,
             hit_count=0,
         )
@@ -778,16 +783,17 @@ class TestPoisonIsRefusedByTheTree(CustomTestCase):
             setattr(node, key, value)
         return node
 
-    def test_write_through_refuses_a_poisoned_node(self):
+    def test_write_through_on_a_detached_node_fails_loudly(self):
         core = self._core()
-        self.assertFalse(core._inc_hit_count_and_check(self._node(poisoned=True)))
+        with self.assertRaises(AssertionError):
+            core._inc_hit_count_and_check(self._node(detached=True))
 
     def test_write_through_still_fires_for_an_ordinary_node(self):
         core = self._core()
         self.assertTrue(core._inc_hit_count_and_check(self._node()))
 
 
-class TestPoisonCoversEveryNodeOfTheChain(CustomTestCase):
+class TestDetachCoversEveryNodeOfTheChain(CustomTestCase):
     """B2. A load's insert can span several nodes, and all of them are bad.
 
     ``_detach_failed_chain`` already walks ``endpoint -> anchor``; the reclaim
@@ -983,19 +989,19 @@ class TestLinkerLoadFailureIsDistinguishable(CustomTestCase):
         self.assertTrue(is_external_kv_load_failure(req))
 
 
-class TestPoisonedChainIsCutOutOfTheTree(CustomTestCase):
+class TestFailedChainIsCutOutOfTheTree(CustomTestCase):
     """The tree side of B1, closed by detaching instead of flagging.
 
-    ``match_prefix`` never consulted ``poisoned``, so a failed load's chain
-    stayed reachable until the reclaim managed to drop it -- and the first
+    ``match_prefix`` consults no per-node validity flag, so a merely flagged
+    chain stayed reachable until the reclaim managed to drop it -- and the first
     request that matched it gave the chain a device child, which is one of the
     conditions ``invalidate_external_load_chain`` declines on. So matching the
     chain once pinned it in the tree permanently: every later request with that
     prefix was served KV that never arrived, at HTTP 200, and could offload its
     own tail -- computed over that KV -- into the shared store.
 
-    Teaching ``match_prefix`` to refuse the flag cannot be done on its own (see
-    ``UnifiedTreeNode.poisoned``). Cutting the chain's top link does the same
+    Teaching ``match_prefix`` to refuse a flag cannot be done on its own (see
+    ``UnifiedTreeNode.detached``). Cutting the chain's top link does the same
     job without touching either walk.
     """
 

@@ -502,13 +502,17 @@ class UnifiedCacheLinkerWrapper:
     def offload_nodes(self, node_ids: Sequence[NodeId]) -> None:
         """Persist a write-through chain.
 
-        Skips nodes the store already has, and nodes a failed load poisoned --
-        those hold no KV, and writing them would put corruption in the store
-        under the legitimate content hash for that token sequence.
+        Skips nodes the store already has. A detached node holds no KV and
+        writing it would put corruption in the store under the legitimate
+        content hash for that token sequence -- but it is also off the tree,
+        so the insert walk that named these ids cannot have reached one.
+        Assert rather than skip: one turning up here means the tree is
+        corrupt.
         """
         for node_id in node_ids:
             node = self.cache.resolve_node_handle(node_id)
-            if not node.external_cache_stored and not node.poisoned:
+            assert not node.detached, f"write-through named detached node {node_id}"
+            if not node.external_cache_stored:
                 self._offload_node(node_id)
 
     def _offload_node(self, node_id: NodeId) -> None:
@@ -591,7 +595,7 @@ class UnifiedCacheLinkerWrapper:
         for write-through -- the opposite of what is wanted.
 
         Detaching, rather than only flagging, is what keeps the chain from
-        being served: match_prefix does not read ``poisoned``, so a flagged
+        being served: match_prefix reads no such flag, so a merely flagged
         chain stayed matchable until the purge managed to drop it, and the
         first request that matched it gave it a device child and blocked the
         reclaim for good.

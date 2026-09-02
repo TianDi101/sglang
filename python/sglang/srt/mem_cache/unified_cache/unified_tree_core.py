@@ -122,23 +122,18 @@ class UnifiedTreeNode:
         self.event_hash_value: Optional[list[str]] = None
         self.hit_count = 0
         self.external_cache_stored = False
-        # Published by an external-linker load that then failed, so the slots
-        # hold no KV. Distinct from external_cache_stored, which says only
-        # whether the store has a copy: absent / present / invalid is three
-        # states and one boolean has room for two.
-        #
-        # Poisoned nodes are cut out of the tree by
-        # detach_external_load_chain, so neither match_prefix nor the insert
-        # walk can reach one. The flag is kept as the write-through refusal
-        # (offload_nodes, _inc_hit_count_and_check) for the window before the
-        # detach and for a split fragment that inherits it.
-        self.poisoned = False
         # Cut out of the tree but not yet freed: still in the arena, still
         # holding its device slots, still locked by whoever owned it when the
         # load failed. Unreachable from the root, so no request can match or
-        # extend it; the purge (or eviction) frees it once the owner releases.
-        # Detaching, rather than editing the node in place, is what lets a
-        # later request simply build a fresh node under the anchor.
+        # extend it; the reclaim (or eviction) frees it once the owner
+        # releases. Detaching, rather than editing the node in place, is what
+        # lets a later request simply build a fresh node under the anchor.
+        #
+        # Set only by detach_external_load_chain today, where it also means
+        # the node's pages hold no KV -- which is why the write-through paths
+        # assert on it rather than test it: being off the tree, such a node
+        # must never turn up on a root-anchored walk in the first place. A
+        # future non-failure detach would have to revisit those asserts.
         self.detached = False
         self.priority = priority
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
@@ -873,11 +868,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node: UnifiedTreeNode, chunked: bool = False
     ) -> bool:
         """Increment hit count; check whether a write backup should be fired."""
+        # A detached node holds no KV; persisting it would put corruption in
+        # the store under the legitimate content hash, where it outlives a
+        # flush. It is off the tree, so this root-anchored walk cannot reach
+        # one -- reaching one means the tree is corrupt, not that a write
+        # needs skipping.
+        assert not node.detached, f"insert walk reached detached node {node.id}"
         if node.evicted or chunked:
-            return False
-        # Its pages never arrived; persisting them would put corruption in the
-        # store under the legitimate content hash, where it outlives a flush.
-        if node.poisoned:
             return False
         if self.is_write_back:
             return False
@@ -999,11 +996,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         if node.evicted:
             self._unevict_node_on_insert(node, state.value[:prefix_len])
-            # Refilled from the inserting request's own freshly computed KV,
-            # so whatever an earlier failed load left here is gone. The
-            # non-evicted branch below keeps the node's existing value, so a
-            # poisoned node there stays poisoned.
-            node.poisoned = False
             state.result.record_adopted_range(
                 BASE_COMPONENT_TYPE,
                 state.total_prefix_length,
@@ -1134,7 +1126,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
         new_node.external_cache_stored = child.external_cache_stored
-        new_node.poisoned = child.poisoned
         new_node.detached = child.detached
         new_node.creation_time = child.creation_time
         # Split fragments stay on the anchor's root path for the ack's walk.
@@ -1382,7 +1373,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         The chain's pages hold no KV, so nothing may match or extend it.
         Marking the nodes is not enough on its own: match_prefix does not
         consult the flag, and it cannot be taught to without also teaching the
-        insert walk to replace a poisoned node's value, because
+        insert walk to replace a flagged node's value, because
         cache_unfinished_req inserts and then re-matches to repoint the
         request -- a match that stops short there leaves the request repointed
         past KV whose duplicate the insert has already freed.
@@ -1393,7 +1384,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         builds a fresh node there. It also makes a declined purge harmless --
         before, a request that matched the chain gave it a device child, which
         is one of the conditions invalidate_external_load_chain declines on, so
-        the first request to match a poisoned chain pinned it in the tree
+        the first request to match a dead chain pinned it in the tree
         permanently.
 
         The nodes keep their arena entry, parent pointer, locks and LRU
@@ -1406,7 +1397,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node = self._node_arena.get(endpoint_id)
         top: Optional[UnifiedTreeNode] = None
         while node is not None and node is not self.root_node and node.id != anchor_id:
-            node.poisoned = True
             node.detached = True
             ids.append(node.id)
             top = node
