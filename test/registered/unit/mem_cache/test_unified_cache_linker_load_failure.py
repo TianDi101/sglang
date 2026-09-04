@@ -131,6 +131,9 @@ def _bare_core(arena=None, **overrides):
     core.page_size = 1
     core.components = ()
     core.full_host_duplicates = {}
+    # Deleting a node clears it from both leaf sets, so they have to exist.
+    core.evictable_device_leaves = set()
+    core.evictable_host_leaves = set()
     core.root_node = SimpleNamespace(id=-1, parent=None, children={})
     core._update_evictable_leaf_sets = lambda node: None
     for key, value in overrides.items():
@@ -1366,6 +1369,28 @@ class TestTombstoneCascadeLeavesNoStaleLeaf(CustomTestCase):
         if parent is not None:
             parent.children[node_id] = node
         return node
+
+    def test_removing_a_leaf_clears_it_from_both_leaf_sets(self):
+        """The choke point, tested directly.
+
+        Every deletion goes through ``_remove_leaf_from_parent``. Two callers
+        had each independently discarded only the host set -- the tombstone
+        cascade and ``_evict_host_leaf`` -- so the rule belongs here rather
+        than in each caller, where it has now been forgotten twice.
+        """
+        parent = FakeNode(0)
+        node = FakeNode(1, parent)
+        node.detached = True
+        core = _bare_core({0: parent, 1: node})
+        core._detached_roots = {1: node}
+        core.evictable_device_leaves = {node}
+        core.evictable_host_leaves = {node}
+
+        core._remove_leaf_from_parent(node)
+
+        self.assertEqual(core.evictable_device_leaves, set())
+        self.assertEqual(core.evictable_host_leaves, set())
+        self.assertNotIn(1, core._node_arena)
 
     def test_a_cascade_deleted_node_does_not_stay_in_device_leaves(self):
         root = self._node(0)

@@ -1769,6 +1769,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             assert node.detached, f"node {node.id} is not its parent's child"
         # Deleted nodes must not linger in duplicate tracking as ghosts.
         self.full_host_duplicates.pop(node.id, None)
+        # Nor in the leaf sets. Every deletion passes through here, so this is
+        # the one place that cannot be forgotten -- and it has been, twice:
+        # both the tombstone cascade and _evict_host_leaf discarded only the
+        # host set before unregistering, leaving the device set pointing at a
+        # node that no longer exists. sanity_check reports that as
+        # `stale nodes in device_leaves`, and the strict idle check makes it
+        # fatal.
+        self.evictable_device_leaves.discard(node)
+        self.evictable_host_leaves.discard(node)
         self._unregister_node(node)
 
     def _evict_component_and_detach_lru(
@@ -1858,15 +1867,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         host_frees=host_frees,
                     )
 
-            # Both sets, not just the host one: a node can be in the device
-            # set here without a device value of its own -- the has_device
-            # branch above adds `cur` on the way past, and a detached chain
-            # node reached by this cascade is never freed through
-            # _release_all_component_layers, which is the only other place
-            # that discards. Leaving it behind unregisters the node while the
-            # set keeps pointing at it, which is what sanity_check reports as
-            # a stale entry in device_leaves.
-            self.evictable_device_leaves.discard(cur)
             self.evictable_host_leaves.discard(cur)
             self._remove_leaf_from_parent(cur)
             parent = cur.parent
