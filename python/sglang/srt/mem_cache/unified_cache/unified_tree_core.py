@@ -2403,11 +2403,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             E(
                 f"{len(stale)} stale nodes in device_leaves: {[n.id for n in list(stale)[:5]]}"
             )
+            E(f"  {self._describe_unreachable(stale, all_node_set)}")
         stale = self.evictable_host_leaves - all_node_set
         if stale:
             E(
                 f"{len(stale)} stale nodes in host_leaves: {[n.id for n in list(stale)[:5]]}"
             )
+            E(f"  {self._describe_unreachable(stale, all_node_set)}")
 
         # Per-component LRU tracking
         for ct in self.component_types:
@@ -2528,6 +2530,43 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             nodes.append(node)
             stack.extend(node.children.values())
         return nodes
+
+    def _describe_unreachable(self, stale, all_node_set) -> str:
+        """Say how each stale node fell out of the walk.
+
+        "in a leaf set but not reachable" is one fact with several possible
+        causes -- the node was unregistered and the set never told, or it is
+        still in the arena but nothing anchors it any more. Those want opposite
+        fixes, and the violation text alone does not separate them, which is
+        worth a few lines here rather than another round of guessing.
+        """
+        out = []
+        for node in list(stale)[:5]:
+            bits = [f"node={node.id}"]
+            bits.append(
+                "in_arena"
+                if self._node_arena.get(node.id) is node
+                else "NOT_in_arena"
+            )
+            bits.append(f"detached={getattr(node, 'detached', None)}")
+            bits.append(f"is_detached_root={node.id in self._detached_roots}")
+            # Climb until we hit something the walk reaches, or run out.
+            chain, cur, hops = [], node.parent, 0
+            while cur is not None and hops < 12:
+                mark = "R" if cur in all_node_set else "-"
+                chain.append(
+                    f"{cur.id}{mark}"
+                    f"{'d' if getattr(cur, 'detached', False) else ''}"
+                )
+                if cur in all_node_set:
+                    break
+                cur, hops = cur.parent, hops + 1
+            if node.parent is None:
+                bits.append("parent=None")
+            else:
+                bits.append("up=" + ">".join(chain) if chain else "up=?")
+            out.append("(" + " ".join(bits) + ")")
+        return "provenance: " + " ".join(out) + "  [R=reached by walk, d=detached]"
 
     def _check_lru_linked_list(
         self,
