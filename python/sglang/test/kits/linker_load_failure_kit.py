@@ -164,11 +164,28 @@ class LinkerLoadFailureMixin:
         response = requests.get(self.base_url + "/health_generate", timeout=120)
         self.assertEqual(response.status_code, 200, "engine died on a load failure")
 
-    def test_gsm8k_accuracy_under_linker_load_failure(self):
-        """A failed load may cost an attempt. It must never change an answer."""
+    def _host_hit_tokens(self):
+        """Prefill tokens served by the external linker, summed over ranks.
+
+        ``sglang:prefill_effective_tokens_total`` splits prefill tokens by
+        origin: ``input`` (computed), ``device_hit`` (the device radix tree),
+        ``host_hit`` (the external linker) and ``storage_hit`` (structurally 0
+        in a linker arm). ``host_hit`` rising is a load-back actually happening.
+        """
+        response = requests.get(self.base_url + "/metrics", timeout=60)
+        response.raise_for_status()
+        total = 0.0
+        for line in response.text.splitlines():
+            if line.startswith("sglang:prefill_effective_tokens_total{") and (
+                'mode="host_hit"' in line
+            ):
+                total += float(line.rsplit(None, 1)[1])
+        return total
+
+    def _run_gsm8k(self):
         from sglang.test.run_eval import run_eval
 
-        metrics = run_eval(
+        return run_eval(
             SimpleNamespace(
                 base_url=self.base_url,
                 eval_name="gsm8k",
@@ -187,12 +204,55 @@ class LinkerLoadFailureMixin:
                 model=getattr(self, "model", None) or "linker-load-failure",
             )
         )
+
+    def test_gsm8k_accuracy_under_linker_load_failure(self):
+        """A failed load may cost an attempt. It must never change an answer.
+
+        Two passes, because one pass reads nothing from the store. gsm8k is a
+        shared few-shot prefix plus a unique tail per question: the prefix is
+        referenced by whatever is in flight so it is never evicted, and no tail
+        is ever asked for twice. Measured on DSV4-Pro, a single pass served
+        305,664 prefill tokens from the device tree and **zero** from the
+        linker -- an 85% cache hit rate with no load-back anywhere in it, so
+        the injector had nothing to fire on and the arm passed while testing
+        nothing.
+
+        So: populate the store, drop the device tree (``/flush_cache`` leaves
+        the external store intact -- that asymmetry is the whole mechanism),
+        then measure. Every prefix in the second pass has to come back through
+        the linker, which is where a failed load can be served as an answer.
+
+        The host_hit assertion below is what keeps this honest. Exposure is a
+        property of the workload and the pool size, not of the code under test,
+        and it can silently go to zero -- so the test fails rather than passes
+        when it has nothing to measure.
+        """
+        warm = self._run_gsm8k()
+        print(
+            f"[{type(self).__name__}] warm pass (populates the store): "
+            f"score={warm['score']:.3f}"
+        )
+        self._flush()
+
+        before = self._host_hit_tokens()
+        metrics = self._run_gsm8k()
+        loaded_back = self._host_hit_tokens() - before
+
         print(
             f"[{type(self).__name__}] gsm8k at "
             f"prob={self.linker_load_failure_prob}: score={metrics['score']:.3f} "
-            f"(threshold {self.gsm8k_threshold})"
+            f"(threshold {self.gsm8k_threshold}), "
+            f"{loaded_back:.0f} tokens loaded back through the linker"
         )
 
+        self.assertGreater(
+            loaded_back,
+            0,
+            "No prefill token came from the external linker during the measured "
+            "pass, so no load could have failed and this arm proves nothing. "
+            "Do not read a pass here as evidence: fix the exposure (device pool "
+            "size, or a workload that re-reads an evicted prefix) first.",
+        )
         self.assertGreaterEqual(
             metrics["score"],
             self.gsm8k_threshold,
