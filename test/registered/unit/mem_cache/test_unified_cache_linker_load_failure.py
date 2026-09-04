@@ -1520,5 +1520,107 @@ class TestFreeingADetachedChain(CustomTestCase):
             core._remove_leaf_from_parent(nodes[1])
 
 
+
+
+class _LeafNode:
+    """Enough node surface for the real leaf-set predicates."""
+
+    def __init__(self, node_id, parent=None, device=True):
+        self.id = node_id
+        self.parent = parent
+        self.detached = False
+        self.key = FakeKey(node_id)
+        self.children = {}
+        self.component_data = (
+            SimpleNamespace(
+                value=object() if device else None,
+                host_value=None,
+                lock_ref=0,
+                host_lock_ref=0,
+            ),
+        )
+        if parent is not None:
+            parent.children[node_id] = self
+
+    @property
+    def evicted(self):
+        return self.component_data[0].value is None
+
+
+class TestALeafSetNeverHoldsADeletedNode(unittest.TestCase):
+    """A node the arena no longer holds must not be in a leaf set.
+
+    The crash this pins reads
+
+        D-leaf extra: [N]
+        1 stale nodes in device_leaves: [N]
+
+    and `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE` (default True) makes it
+    fatal. Deleting a node clears it from both sets; what put it back is
+    `_update_evictable_leaf_sets(parent)`, which several callers reach after a
+    delete -- and the parent can already be gone.
+
+    A failed load is what makes that reachable. A detached chain's endpoint
+    counts as a device leaf while a child holding no device KV still hangs off
+    it (`_is_device_leaf` only rejects children with Full KV *on device*), so
+    the endpoint is freed first, and that child's later deletion arrives here
+    naming a parent that is no longer in the tree.
+    """
+
+    def _core(self):
+        core = UnifiedTreeCore.__new__(UnifiedTreeCore)
+        core.root_node = _LeafNode(-1, device=False)
+        core._detached_roots = {}
+        core.full_host_duplicates = {}
+        core.components = ()
+        core.components_by_type = {}
+        core.component_types = ()
+        core.page_size = 1
+        core.is_write_back = False
+        core.evictable_device_leaves = set()
+        core.evictable_host_leaves = set()
+        # anchor <- top <- endpoint <- a node built under the chain
+        anchor = _LeafNode(184, core.root_node)
+        top = _LeafNode(239, anchor)
+        end = _LeafNode(238, top)
+        child = _LeafNode(300, end, device=False)
+        core._node_arena = {
+            n.id: n for n in (core.root_node, anchor, top, end, child)
+        }
+        return core, anchor, top, end, child
+
+    def test_the_endpoint_is_a_device_leaf_while_a_child_hangs_off_it(self):
+        """The enabling condition, stated on its own so it cannot drift."""
+        core, _anchor, _top, end, _child = self._core()
+
+        self.assertTrue(core._is_device_leaf(end))
+
+    def test_a_deleted_parent_is_not_put_back_when_its_child_goes(self):
+        core, _anchor, _top, end, child = self._core()
+        core._update_evictable_leaf_sets(end)
+        self.assertIn(end, core.evictable_device_leaves)
+
+        # The endpoint is freed while the child still hangs off it.
+        core._remove_leaf_from_parent(end)
+        self.assertNotIn(238, core._node_arena)
+        # Now the child goes, and its parent is named to be re-evaluated.
+        core._update_evictable_leaf_sets(child.parent)
+
+        self.assertNotIn(end, core.evictable_device_leaves)
+        self.assertNotIn(end, core.evictable_host_leaves)
+
+    def test_a_node_still_in_the_tree_is_unaffected(self):
+        """The guard keys on arena membership, not on the detached flag.
+
+        The endpoint is detached and qualifies as a device leaf; for as long as
+        the arena holds it, it belongs in the set.
+        """
+        core, _anchor, _top, end, _child = self._core()
+        end.detached = True
+
+        core._update_evictable_leaf_sets(end)
+
+        self.assertIn(end, core.evictable_device_leaves)
+
 if __name__ == "__main__":
     unittest.main()

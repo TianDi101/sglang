@@ -1251,6 +1251,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 "".join(traceback.format_stack(limit=12)),
             )
 
+        if self._node_arena.get(node.id) is not node:
+            # A node the tree no longer holds never belongs in a leaf set.
+            # Callers reach one by passing `node.parent` after deleting a node,
+            # and a parent can already be gone: a chain endpoint counts as a
+            # device leaf while a child with no device KV still hangs off it,
+            # so it is freed first and that child's later deletion arrives here
+            # with a dead parent. Guarding at the single point that adds is the
+            # same argument as clearing at the single point that deletes.
+            self.evictable_device_leaves.discard(node)
+            self.evictable_host_leaves.discard(node)
+            return
+
         if self._is_device_leaf(node):
             self.evictable_device_leaves.add(node)
         else:
@@ -2575,13 +2587,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
             bits.append(f"detached={getattr(node, 'detached', None)}")
             bits.append(f"is_detached_root={node.id in self._detached_roots}")
-            # Climb until we hit something the walk reaches, or run out.
+            # Climb until we hit something the walk reaches, or run out. Each
+            # ancestor reports arena membership too: whether the chain above a
+            # stale node is still held is the difference between "its anchor
+            # was freed" and "its anchor is still there and simply unlinked",
+            # and inferring that instead of printing it is how this gets
+            # misread.
             chain, cur, hops = [], node.parent, 0
             while cur is not None and hops < 12:
                 mark = "R" if cur in all_node_set else "-"
                 chain.append(
                     f"{cur.id}{mark}"
                     f"{'d' if getattr(cur, 'detached', False) else ''}"
+                    f"{'' if self._node_arena.get(cur.id) is cur else 'X'}"
                 )
                 if cur in all_node_set:
                     break
@@ -2591,7 +2609,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             else:
                 bits.append("up=" + ">".join(chain) if chain else "up=?")
             out.append("(" + " ".join(bits) + ")")
-        return "provenance: " + " ".join(out) + "  [R=reached by walk, d=detached]"
+        return (
+            "provenance: "
+            + " ".join(out)
+            + "  [R=reached by walk, d=detached, X=not in arena]"
+        )
 
     def _check_lru_linked_list(
         self,
