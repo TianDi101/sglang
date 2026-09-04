@@ -17,7 +17,9 @@ cache for cache-level logic, but the TreeCore itself never touches it.
 from __future__ import annotations
 
 import logging
+import os
 import sys
+import traceback
 from array import array
 from collections import defaultdict
 from enum import Enum, auto
@@ -84,6 +86,13 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 logger = logging.getLogger(__name__)
+
+# Off by default: logs a stack every time a node the arena no longer holds is
+# put back into a leaf set. That is the shape of the `stale nodes in
+# device_leaves` crash, and the stack names the caller directly instead of
+# leaving it to be inferred by reading the call sites -- which produced three
+# wrong fixes for this crash before it was measured.
+SGLANG_DEBUG_LEAF_SET_READD = os.environ.get("SGLANG_DEBUG_LEAF_SET_READD", "0") == "1"
 
 # 42 bits: digest * 1000003 (< 2^20) stays under 2^62, so the update never
 # overflows int64 with plain (non-wrapping) arithmetic in the Rust port, and
@@ -1226,6 +1235,22 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
+        if (
+            SGLANG_DEBUG_LEAF_SET_READD
+            and self._node_arena.get(node.id) is not node
+            and (self._is_device_leaf(node) or self._is_host_leaf(node))
+        ):
+            # A node the arena no longer holds is about to go back into a leaf
+            # set, which is exactly the `stale nodes in device_leaves` crash.
+            # Name the caller rather than infer it -- reading the callers is
+            # what produced three wrong fixes for this.
+            logger.error(
+                "leaf-set re-add of unregistered node %s (detached=%s):\n%s",
+                node.id,
+                getattr(node, "detached", None),
+                "".join(traceback.format_stack(limit=12)),
+            )
+
         if self._is_device_leaf(node):
             self.evictable_device_leaves.add(node)
         else:
