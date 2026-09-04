@@ -766,6 +766,27 @@ class TestReclaimFailedLinkerChain(CustomTestCase):
         self.assertEqual(attempts, [1])
         self.assertEqual(cache._stranded_linker_nodes, [])
 
+    def test_the_retry_list_is_bounded(self):
+        # Switching from "give up" to "retry" is only safe if the list cannot
+        # grow: a node that stays owned is retried on every finishing request,
+        # so naming it twice would accumulate a pass per duplicate.
+        cache, attempts = self._cache({"rid-a": [1]}, [False] * 50)
+
+        cache._reclaim_failed_linker_chain("rid-a")
+        for i in range(20):
+            cache._reclaim_failed_linker_chain(f"rid-{i}")
+
+        self.assertEqual(cache._stranded_linker_nodes, [1])
+        self.assertEqual(len(attempts), 21, "one attempt per pass, no more")
+
+    def test_the_same_node_is_never_retried_twice_in_one_pass(self):
+        cache, attempts = self._cache({"rid-a": [4], "rid-b": [4]}, [False] * 4)
+
+        cache._reclaim_failed_linker_chain("rid-a")
+        cache._reclaim_failed_linker_chain("rid-b")
+
+        self.assertEqual(cache._stranded_linker_nodes, [4])
+
     def test_a_retry_is_attempted_before_a_freshly_failed_chain(self):
         # Endpoint-first ordering is what makes a chain free-able at all, and
         # an older chain's endpoint is not below a newer one.

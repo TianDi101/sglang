@@ -2851,6 +2851,9 @@ class UnifiedRadixCache(BasePrefixCache):
         pending = self._stranded_linker_nodes + self.linker.take_failed_chain(rid)
         if not pending:
             return
+        # Keep the endpoint-first order but name each node once: retrying is
+        # only bounded if the list cannot accumulate the same node twice.
+        pending = list(dict.fromkeys(pending))
         self._stranded_linker_nodes = []
         stranded: list[NodeId] = []
         for node_id in pending:
