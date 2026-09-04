@@ -464,20 +464,34 @@ class TestSchedulerMarkHook(CustomTestCase):
     the free and the streaming.
     """
 
-    def _make_req(self, rid):
+    def _make_req(self, rid, last_node=None):
         req = MagicMock()
         req.rid = rid
+        req.last_node = last_node
         req.finished.return_value = False
         req.finished_reason = None
         req.to_finish = None
         req.skip_radix_cache_insert = False
         return req
 
-    def _run(self, failed_rids, batch_reqs, running_reqs=(), chunked_req=None):
+    def _run(
+        self,
+        failed_rids,
+        batch_reqs,
+        running_reqs=(),
+        chunked_req=None,
+        detached_nodes=(),
+    ):
         released = []
 
         tree_cache = MagicMock()
         tree_cache.drain_linker_loads.return_value = list(failed_rids)
+        tree_cache.has_outstanding_failed_linker_chains.return_value = bool(
+            detached_nodes
+        )
+        tree_cache.is_on_failed_linker_chain.side_effect = (
+            lambda node_id: node_id in set(detached_nodes)
+        )
 
         batch = MagicMock()
         batch.reqs = list(batch_reqs)
@@ -595,24 +609,93 @@ class TestSchedulerMarkHook(CustomTestCase):
         self.assertEqual(scheduler._deferred_linker_rids, {"rid-gone"})
 
 
-class TestReclaimFailedLinkerChain(CustomTestCase):
-    """The reclaim is keyed by rid and fires once, at the release point.
+class TestSchedulerAbortsChainCoOwners(CustomTestCase):
+    """A failed load's chain can be held by a request that issued no load.
 
-    ``cache_finished_req`` is the one place where the whole chain becomes
-    reclaimable: Full is a path-unlock, so the request's single
-    ``dec_lock_ref`` clears ``lock_ref`` on every node of the chain at once.
-    Nothing polls, so there is no attempt budget to tune -- a chain someone
-    else still owns is left to eviction, which reaches it because detaching
-    kept its LRU membership.
+    The chain goes into the tree before the transfer is verified, so a request
+    that arrives while the load is in flight matches it and is repointed onto
+    exactly those pages. It appears in no rid list -- the linker knows only the
+    rids it queued -- so naming is not enough to find it; it has to be found by
+    where it points. Left alone it is served KV that never arrived, at HTTP
+    200, which is the one outcome this whole path exists to prevent, and its
+    next ``cache_unfinished_req`` re-inserts the chain's pages under a fresh
+    node on top of that.
     """
 
-    def _cache(self, chains, drop_results):
+    _make_req = TestSchedulerMarkHook._make_req
+    _run = TestSchedulerMarkHook._run
+
+    def test_aborts_a_request_that_holds_a_chain_but_named_no_load(self):
+        loader = self._make_req("rid-a", last_node=5)
+        co_owner = self._make_req("rid-b", last_node=5)
+
+        _scheduler, released, _release_kv = self._run(
+            ["rid-a"], [loader, co_owner], detached_nodes=[5]
+        )
+
+        self.assertIsInstance(co_owner.to_finish, FINISH_ABORT)
+        self.assertTrue(co_owner.skip_radix_cache_insert)
+        self.assertCountEqual(released, ["rid-a", "rid-b"])
+
+    def test_leaves_a_request_that_points_somewhere_else_alone(self):
+        loader = self._make_req("rid-a", last_node=5)
+        elsewhere = self._make_req("rid-b", last_node=11)
+
+        self._run(["rid-a"], [loader, elsewhere], detached_nodes=[5])
+
+        self.assertIsNone(elsewhere.to_finish)
+
+    def test_a_co_owner_in_the_running_batch_is_found_too(self):
+        # It has already left the extend batch, and it is decoding over the
+        # pages the load never filled.
+        loader = self._make_req("rid-a", last_node=5)
+        co_owner = self._make_req("rid-b", last_node=5)
+
+        self._run(["rid-a"], [loader], running_reqs=[co_owner], detached_nodes=[5])
+
+        self.assertIsInstance(co_owner.to_finish, FINISH_ABORT)
+
+    def test_the_sweep_still_runs_when_no_new_load_failed(self):
+        # The verdict and the co-owner do not have to land in the same step:
+        # a chain detached earlier is still in the tree until its last owner
+        # releases, and a request can match it right up to that point.
+        co_owner = self._make_req("rid-b", last_node=5)
+
+        self._run([], [co_owner], detached_nodes=[5])
+
+        self.assertIsInstance(co_owner.to_finish, FINISH_ABORT)
+
+    def test_no_outstanding_chain_means_the_walk_is_never_run(self):
+        # The sweep costs a parent walk per request per step, so it must be
+        # gated on there being a chain to find owners of.
+        req = self._make_req("rid-a", last_node=5)
+
+        scheduler, _released, _release_kv = self._run(["rid-a"], [req])
+
+        self.assertFalse(scheduler.tree_cache.is_on_failed_linker_chain.called)
+
+
+class TestReclaimFailedLinkerChain(CustomTestCase):
+    """The reclaim is keyed by rid, and keeps what it could not free.
+
+    ``cache_finished_req`` is where the loading request's whole chain becomes
+    reclaimable: Full is a path-unlock, so that single ``dec_lock_ref`` clears
+    ``lock_ref`` on every node of the chain at once. But the loading request is
+    not always the last owner -- a request that matched the chain in the tree
+    while the load was still in flight holds it too -- so a node that declines
+    is carried to the next pass rather than abandoned. Nothing polls: the retry
+    rides on the next request to finish, and the list is empty in the ordinary
+    case.
+    """
+
+    def _cache(self, chains, drop_results, gone=()):
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.linker = MagicMock()
         cache.linker.take_failed_chain.side_effect = lambda rid: chains.pop(rid, [])
         cache._free_values = MagicMock()
+        cache._stranded_linker_nodes = []
 
         attempts = []
 
@@ -626,6 +709,9 @@ class TestReclaimFailedLinkerChain(CustomTestCase):
 
         cache.tree_core = MagicMock()
         cache.tree_core.invalidate_external_load_chain.side_effect = invalidate
+        cache.tree_core.holds_detached_node.side_effect = lambda node_id: (
+            node_id not in gone
+        )
         return cache, attempts
 
     def test_frees_the_whole_chain_endpoint_first(self):
@@ -652,17 +738,45 @@ class TestReclaimFailedLinkerChain(CustomTestCase):
 
         self.assertEqual(attempts, [])
 
-    def test_a_chain_someone_else_owns_is_left_to_eviction(self):
-        # Declining must not schedule a retry: the remaining owners -- a
-        # request that matched the chain before the load failed, a host copy,
-        # an in-flight DMA -- release on no step bound, and eviction already
-        # reaches a detached node.
-        cache, attempts = self._cache({"rid-a": [1]}, [False])
+    def test_a_chain_someone_else_owns_is_retried_until_it_is_freed(self):
+        # Abandoning it is not safe. The chain keeps its device slots while it
+        # sits in the arena, and the request still pointing into it goes on to
+        # insert those same slots under a fresh node -- one set of pages, two
+        # owners, which is the pool-accounting leak. Eviction is no answer
+        # either: a locked node is not a device leaf, so eviction skips it for
+        # exactly as long as the other owner holds it.
+        cache, attempts = self._cache({"rid-a": [1]}, [False, True])
 
         cache._reclaim_failed_linker_chain("rid-a")
+        self.assertEqual(cache._stranded_linker_nodes, [1])
+
+        # The other owner releases; the next request to finish frees it.
+        cache._reclaim_failed_linker_chain("rid-b")
+
+        self.assertEqual(attempts, [1, 1])
+        self.assertEqual(cache._stranded_linker_nodes, [])
+
+    def test_a_node_eviction_reached_first_leaves_the_retry_list(self):
+        # Otherwise the list grows without bound: the node is gone from the
+        # arena, so invalidate can never report it dropped.
+        cache, attempts = self._cache({"rid-a": [1]}, [False, False], gone={1})
+
         cache._reclaim_failed_linker_chain("rid-a")
 
-        self.assertEqual(attempts, [1], "the reclaim polled instead of giving up")
+        self.assertEqual(attempts, [1])
+        self.assertEqual(cache._stranded_linker_nodes, [])
+
+    def test_a_retry_is_attempted_before_a_freshly_failed_chain(self):
+        # Endpoint-first ordering is what makes a chain free-able at all, and
+        # an older chain's endpoint is not below a newer one.
+        cache, attempts = self._cache(
+            {"rid-a": [1], "rid-b": [9, 8]}, [False, True, True, True]
+        )
+
+        cache._reclaim_failed_linker_chain("rid-a")
+        cache._reclaim_failed_linker_chain("rid-b")
+
+        self.assertEqual(attempts, [1, 1, 9, 8])
 
 
 class TestCacheFinishedReqReclaimsAfterTheUnlock(CustomTestCase):
@@ -1112,6 +1226,69 @@ class TestDetachExternalLoadChain(CustomTestCase):
         nodes, core = self._chain(2)
         self.assertEqual(core.detach_external_load_chain(404, 0), [])
         self.assertEqual(core._detached_roots, {})
+
+
+class TestOwnershipOfADetachedChain(CustomTestCase):
+    """The two tree-core probes the reclaim and the sweep are built on."""
+
+    def _core(self, nodes, root):
+        core = UnifiedTreeCore.__new__(UnifiedTreeCore)
+        core._node_arena = {n.id: n for n in nodes}
+        core.root_node = root
+        return core
+
+    def _node(self, node_id, parent=None, detached=False):
+        class _Node:
+            pass
+
+        node = _Node()
+        node.id = node_id
+        node.parent = parent
+        node.detached = detached
+        return node
+
+    def test_a_node_on_the_chain_is_on_the_chain(self):
+        root = self._node(0)
+        top = self._node(1, parent=root, detached=True)
+        core = self._core([root, top], root)
+
+        self.assertTrue(core.is_on_detached_chain(1))
+
+    def test_a_node_built_under_the_chain_is_on_it_too(self):
+        # A request that matched the chain and then extended it owns a node
+        # the detach never touched, hanging off one that it did. Its pages are
+        # its own, but its prefix is the chain's.
+        root = self._node(0)
+        top = self._node(1, parent=root, detached=True)
+        below = self._node(2, parent=top)
+        core = self._core([root, top, below], root)
+
+        self.assertTrue(core.is_on_detached_chain(2))
+
+    def test_an_ordinary_node_is_not(self):
+        root = self._node(0)
+        node = self._node(1, parent=root)
+        core = self._core([root, node], root)
+
+        self.assertFalse(core.is_on_detached_chain(1))
+
+    def test_the_root_is_not(self):
+        root = self._node(0)
+
+        self.assertFalse(self._core([root], root).is_on_detached_chain(0))
+
+    def test_a_node_that_is_gone_is_not(self):
+        root = self._node(0)
+
+        self.assertFalse(self._core([root], root).is_on_detached_chain(99))
+
+    def test_holds_detached_node_follows_the_arena(self):
+        root = self._node(0)
+        node = self._node(1, parent=root, detached=True)
+        core = self._core([root, node], root)
+
+        self.assertTrue(core.holds_detached_node(1))
+        self.assertFalse(core.holds_detached_node(99))
 
 
 class TestFreeingADetachedChain(CustomTestCase):

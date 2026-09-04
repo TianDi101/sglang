@@ -269,6 +269,19 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def holds_detached_node(self, node_id: NodeId) -> bool:
+        """Whether the arena still holds this node, so a declined reclaim can
+        tell "still owned, retry" from "already gone, drop it"."""
+        ...
+
+    @abstractmethod
+    def is_on_detached_chain(self, node_id: NodeId) -> bool:
+        """Whether this node, or any ancestor of it, is on a chain a failed
+        external-linker load left detached -- i.e. whether a request pointing
+        here is pointing at KV that never arrived."""
+        ...
+
+    @abstractmethod
     def invalidate_external_load_chain(
         self, node_id: NodeId
     ) -> DropSubtreeNoHostResult:

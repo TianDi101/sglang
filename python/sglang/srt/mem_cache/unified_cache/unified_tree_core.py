@@ -1413,6 +1413,34 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._detached_roots[top.id] = top
         return ids
 
+    def holds_detached_node(self, node_id: NodeId) -> bool:
+        """Whether the arena still holds this node.
+
+        A chain the reclaim gave up on is retried until it is freed, and a node
+        eviction reached first is simply gone -- there is nothing left to free
+        and nothing left to retry. Distinguishing that from "still owned" is
+        what keeps the retry list from growing without bound.
+        """
+        return node_id in self._node_arena
+
+    def is_on_detached_chain(self, node_id: NodeId) -> bool:
+        """Whether node_id hangs off a chain a failed load left cut out.
+
+        The chain's pages hold no KV, so anything still pointing into it is
+        pointing at KV that never arrived: the chain nodes themselves, and any
+        node a request built underneath one before the load's verdict landed.
+        Hence a walk to the root rather than a test of the node alone.
+
+        A detached node is unreachable from the root but keeps its own parent
+        pointer, so the walk still terminates at the root.
+        """
+        node = self._node_arena.get(node_id)
+        while node is not None and node is not self.root_node:
+            if node.detached:
+                return True
+            node = node.parent
+        return False
+
     def invalidate_external_load_chain(
         self, node_id: NodeId
     ) -> DropSubtreeNoHostResult:
