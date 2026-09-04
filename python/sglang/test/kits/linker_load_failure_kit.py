@@ -178,6 +178,13 @@ class LinkerLoadFailureMixin:
                 num_threads=self.gsm8k_parallel,
                 num_shots=self.gsm8k_num_shots,
                 max_tokens=self.gsm8k_max_new_tokens,
+                # Required, and only by the report writer at the very end:
+                # it names the dump file `sampler.model.replace("/", "_")`,
+                # so leaving it None raises AttributeError *after* the score
+                # has been computed and printed -- losing a finished eval to
+                # a filename. GenerateSampler does not resolve it from the
+                # server the way the OpenAI-shaped samplers can.
+                model=getattr(self, "model", None) or "linker-load-failure",
             )
         )
         print(
