@@ -7,28 +7,31 @@ size, same eviction pressure, so the same load-backs happen.
 
 What is being pinned
 --------------------
-A failed remote KV read must not reach the client as an answer. It can abort
-the request, and the engine has to survive it, but the one outcome the fix
-exists to prevent is a request that loads KV which never arrived and then
+A failed remote KV read must not reach the client as an answer. It can cost a
+request an attempt, and the engine has to survive it, but the one outcome the
+fix exists to prevent is a request that loads KV which never arrived and then
 generates from it at HTTP 200.
 
-Accuracy is how that is measured, and gsm8k is what makes it measurable:
-every question has a known-correct answer, so a request served over KV that
-never arrived shows up as a *wrong* answer rather than a missing one. That
-distinction is the whole assertion --
+Accuracy is how that is measured, and gsm8k is what makes it measurable: every
+question has a known-correct answer, so a request served over KV that never
+arrived shows up as a *wrong* answer. That is why this is a stronger check than
+comparing token ids between two runs -- runs taking different cache paths
+diverge on random token ids with nothing wrong, so a diff cannot separate
+corruption from a different-but-valid path. Ground truth can.
 
-    correct + aborted >= threshold
-
--- and it is why this is a stronger check than comparing token ids between two
-runs. Two runs that take different cache paths diverge on random token ids
-even with nothing wrong, so a token diff cannot separate corruption from a
-different-but-valid path. Ground truth can.
+The eval is ``run_eval(eval_name="gsm8k")``, unmodified. Its ``GenerateSampler``
+retries a failed request six times with exponential backoff and returns an empty
+string only if all six are exhausted, so an aborted request is retried rather
+than lost. At the injection rates used here a question needs six consecutive
+failed load batches to score zero, which is why this arm is held to the *same*
+accuracy threshold as the healthy one rather than a relaxed one: the retry
+absorbs the aborts, and anything left is corruption.
 """
 
 from __future__ import annotations
 
 import random
-from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import requests
 
@@ -46,13 +49,11 @@ class LinkerLoadFailureMixin:
 
     # Matches the disaggregation failure test's rate. High enough that the
     # abort path is hit many times over a 200-question eval, low enough that
-    # most requests still complete and accuracy stays measurable.
+    # the sampler's retry still absorbs it.
     linker_load_failure_prob: float = 0.05
 
-    # Of the questions asked, this fraction must come back either correct or
-    # aborted. The complement is the budget for answers that were served and
-    # wrong -- which is what serving a failed load looks like.
-    correct_or_aborted_threshold: float = 0.93
+    # gsm8k settings. num_shots matches the healthy arm; GSM8KEval's own
+    # default is 5.
     num_gsm8k_questions: int = 200
     gsm8k_num_shots: int = 10
     gsm8k_max_new_tokens: int = 512
@@ -105,12 +106,14 @@ class LinkerLoadFailureMixin:
 
         Sends requests that have to come back through the linker -- warm the
         store, drop the device tree, ask again -- until one of them is aborted.
+        Unlike the eval, this probe does not retry, so it sees the abort the
+        eval's sampler would have hidden.
 
         Finding no abort at all is a failure and not a pass: it means the
         injector never fired, or the requests never reached the linker, and
-        either way every other assertion here would have been measuring
-        nothing. This is the sensitivity control, and it is the thing a fault
-        test most often silently loses.
+        either way the accuracy assertion would have been measuring an
+        uninjected run. This is the sensitivity control, and it is the thing a
+        fault test most often silently loses.
         """
         rng = random.Random(20260904)
         served_after_abort = 0
@@ -161,107 +164,35 @@ class LinkerLoadFailureMixin:
         response = requests.get(self.base_url + "/health_generate", timeout=120)
         self.assertEqual(response.status_code, 200, "engine died on a load failure")
 
-    def _gsm8k_questions(self):
-        """Few-shot prompts and their known answers.
-
-        Reuses the prompt construction and answer parsing from
-        ``few_shot_gsm8k``; only that module's ``run_eval`` driver is
-        deprecated, and this does not use it -- see
-        ``test_gsm8k_accuracy_under_linker_load_failure`` for why it cannot.
-        """
-        from sglang.test.few_shot_gsm8k import (
-            get_answer_value,
-            get_few_shot_examples,
-            get_one_example,
-        )
-        from sglang.utils import download_and_cache_file, read_jsonl
-
-        lines = list(
-            read_jsonl(
-                download_and_cache_file(
-                    "https://raw.githubusercontent.com/openai/grade-school-math"
-                    "/master/grade_school_math/data/test.jsonl"
-                )
-            )
-        )
-        few_shot = get_few_shot_examples(lines, self.gsm8k_num_shots)
-        return [
-            (
-                few_shot + get_one_example(lines, i, False),
-                get_answer_value(lines[i]["answer"]),
-            )
-            for i in range(min(self.num_gsm8k_questions, len(lines)))
-        ], get_answer_value
-
-    def _ask_one_question(self, prompt):
-        """One gsm8k question. Returns its text, or None if it was aborted."""
-        response = requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": prompt,
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": self.gsm8k_max_new_tokens,
-                    "stop": ["Question", "Assistant:", "<|separator|>"],
-                },
-            },
-            timeout=1200,
-        )
-        if response.status_code != 200:
-            return None
-        body = response.json()
-        finish_reason = (body.get("meta_info") or {}).get("finish_reason") or {}
-        if finish_reason.get("type") == "abort":
-            return None
-        return body.get("text", "")
-
     def test_gsm8k_accuracy_under_linker_load_failure(self):
-        """A failed load may cost an answer. It must never change one.
+        """A failed load may cost an attempt. It must never change an answer."""
+        from sglang.test.run_eval import run_eval
 
-        Asks the questions directly rather than through
-        ``few_shot_gsm8k.run_eval`` or ``run_eval``, because both give up the
-        moment a request fails, and requests failing is the entire point here.
-        The sgl-lang path in particular stores the error on the state and never
-        fills the variable, so reading ``states[i]["answer"]`` raises KeyError
-        on the first abort and the whole eval is lost -- the accuracy number
-        that matters would never be computed. Neither harness retries, so a
-        request aborted once stays aborted.
-
-        Asking directly also separates *aborted* from *unparseable*, which the
-        harnesses fold together into ``invalid``. That distinction is load
-        bearing: garbage generated over KV that never arrived can easily fail
-        to parse, and counting it as "invalid" would forgive exactly the
-        outcome under test.
-        """
-        questions, get_answer_value = self._gsm8k_questions()
-        aborted = correct = wrong = 0
-
-        with ThreadPoolExecutor(max_workers=self.gsm8k_parallel) as pool:
-            answers = pool.map(
-                self._ask_one_question, [prompt for prompt, _ in questions]
+        metrics = run_eval(
+            SimpleNamespace(
+                base_url=self.base_url,
+                eval_name="gsm8k",
+                # SGLang-native /generate, the transport the healthy arm uses.
+                api="generate",
+                num_examples=self.num_gsm8k_questions,
+                num_threads=self.gsm8k_parallel,
+                num_shots=self.gsm8k_num_shots,
+                max_tokens=self.gsm8k_max_new_tokens,
             )
-            for (_, label), answer in zip(questions, answers):
-                if answer is None:
-                    aborted += 1
-                elif get_answer_value(answer) == label:
-                    correct += 1
-                else:
-                    wrong += 1
-
-        total = len(questions)
+        )
         print(
             f"[{type(self).__name__}] gsm8k at "
-            f"prob={self.linker_load_failure_prob}: correct={correct}/{total} "
-            f"aborted={aborted} wrong={wrong}"
+            f"prob={self.linker_load_failure_prob}: score={metrics['score']:.3f} "
+            f"(threshold {self.gsm8k_threshold})"
         )
 
         self.assertGreaterEqual(
-            (correct + aborted) / total,
-            self.correct_or_aborted_threshold,
-            f"{wrong}/{total} questions were answered, and answered wrongly, "
-            "under injected load failures. A failed load is allowed to cost an "
-            "answer; it is not allowed to change one. Serving KV that never "
-            "arrived is what this looks like.",
+            metrics["score"],
+            self.gsm8k_threshold,
+            "gsm8k accuracy fell under injected linker load failures. The "
+            "sampler retries a failed request six times, so aborts alone "
+            "should not move this number -- a drop means questions were "
+            "answered from KV that never arrived.",
         )
 
         response = requests.get(self.base_url + "/health_generate", timeout=120)
