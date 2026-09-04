@@ -1858,6 +1858,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         host_frees=host_frees,
                     )
 
+            # Both sets, not just the host one: a node can be in the device
+            # set here without a device value of its own -- the has_device
+            # branch above adds `cur` on the way past, and a detached chain
+            # node reached by this cascade is never freed through
+            # _release_all_component_layers, which is the only other place
+            # that discards. Leaving it behind unregisters the node while the
+            # set keeps pointing at it, which is what sanity_check reports as
+            # a stale entry in device_leaves.
+            self.evictable_device_leaves.discard(cur)
             self.evictable_host_leaves.discard(cur)
             self._remove_leaf_from_parent(cur)
             parent = cur.parent

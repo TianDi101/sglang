@@ -1291,6 +1291,85 @@ class TestOwnershipOfADetachedChain(CustomTestCase):
         self.assertFalse(core.holds_detached_node(99))
 
 
+class TestTombstoneCascadeLeavesNoStaleLeaf(CustomTestCase):
+    """The cascade must drop a node from *both* leaf sets when it deletes it.
+
+    ``_release_all_component_layers`` discards the device set and the host set
+    together; the cascade's own delete discarded only the host one. A node left
+    in ``evictable_device_leaves`` after its arena entry is gone is what
+    ``sanity_check`` reports as ``stale nodes in device_leaves``, and the strict
+    idle check turns that into a crash -- observed on all 8 ranks of a DSv4-Pro
+    run once the earlier failures stopped ending the process first.
+
+    The cascade reaches such a node through a failed load: it walks
+    ``deleted.parent``, and the parent of a request's own node can be a
+    detached chain node, which the ``has_device`` branch adds to the device set
+    on the way past.
+    """
+
+    def _core(self, cur, parent, root):
+        core = UnifiedTreeCore.__new__(UnifiedTreeCore)
+        core.root_node = root
+        core._node_arena = {n.id: n for n in (cur, parent, root)}
+        core._detached_roots = {}
+        core.full_host_duplicates = {}
+        core.components = ()
+        core.components_by_type = {}
+        core.page_size = 1
+        core.evictable_device_leaves = {cur}
+        core.evictable_host_leaves = set()
+        core._update_evictable_leaf_sets = lambda node: None
+        return core
+
+    def _node(self, node_id, parent=None, detached=False):
+        class _Key:
+            def child_key(self, page_size):
+                return node_id
+
+        class _Data:
+            value = None
+            host_value = None
+            lock_ref = 0
+            host_lock_ref = 0
+
+        class _Node:
+            pass
+
+        node = _Node()
+        node.id = node_id
+        node.parent = parent
+        node.detached = detached
+        node.key = _Key()
+        node.children = {}
+        node.component_data = (_Data(),)
+        if parent is not None:
+            parent.children[node_id] = node
+        return node
+
+    def test_a_cascade_deleted_node_does_not_stay_in_device_leaves(self):
+        root = self._node(0)
+        parent = self._node(1, parent=root)
+        # `cur`: no value on either layer, so the cascade deletes it -- and it
+        # is in the device set, which is the state the has_device branch and a
+        # detached chain node produce together.
+        cur = self._node(2, parent=parent, detached=True)
+        deleted = self._node(3, parent=cur)
+        cur.children.pop(3)
+        core = self._core(cur, parent, root)
+
+        core._iteratively_delete_tombstone_leaf(
+            deleted, tracker={}, device_frees={}, host_frees={}
+        )
+
+        self.assertNotIn(
+            2,
+            [n.id for n in core.evictable_device_leaves],
+            "the cascade unregistered the node but left the device-leaf set "
+            "pointing at it -- sanity_check reports that as a stale entry",
+        )
+        self.assertNotIn(2, core._node_arena, "the node should have been deleted")
+
+
 class TestFreeingADetachedChain(CustomTestCase):
     """A detached node is off the tree, so the free must not assume otherwise."""
 
