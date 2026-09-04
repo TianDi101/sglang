@@ -572,7 +572,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _unregister_node(self, node: UnifiedTreeNode) -> None:
         """Drop a tree node from the arena."""
         self._node_arena.pop(node.id, None)
-        self._detached_roots.pop(node.id, None)
+        if self._detached_roots.pop(node.id, None) is not None:
+            # A detached chain is anchored in _detached_roots by its top node
+            # only; the rest hangs off it, and that is the sole way anything
+            # still reaches them -- the walk that collects every live node for
+            # the sanity check starts from the root and these roots.
+            #
+            # The chain is freed endpoint-first, from the bottom, so a node
+            # above can go while one below is still owned by a request that
+            # matched the chain before the load failed. Dropping this node
+            # without re-anchoring its children orphans them: still in the
+            # arena, still in the evictable leaf sets, unreachable from the
+            # walk -- which sanity_check reports as a stale device leaf.
+            for child in node.children.values():
+                self._detached_roots[child.id] = child
 
     def inc_lock_ref(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()

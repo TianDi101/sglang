@@ -1370,6 +1370,33 @@ class TestTombstoneCascadeLeavesNoStaleLeaf(CustomTestCase):
             parent.children[node_id] = node
         return node
 
+    def test_freeing_a_detached_root_re_anchors_what_hung_off_it(self):
+        """The chain must stay reachable while any of it survives.
+
+        ``_detached_roots`` anchors a detached chain by its top node only; the
+        rest hangs off it, and sanity_check's walk (root plus those roots) is
+        the only thing that reaches them. The chain frees endpoint-first, from
+        the bottom, so a node above can go while one below is still owned by a
+        request that matched the chain before the load failed -- orphaning it
+        in the arena and in the leaf sets, invisible to the walk. That is the
+        ``D-leaf extra`` / ``stale nodes in device_leaves`` pair.
+        """
+        root = FakeNode(0)
+        top = FakeNode(1, root)
+        endpoint = FakeNode(2, top)
+        top.detached = endpoint.detached = True
+        core = _bare_core({0: root, 1: top, 2: endpoint})
+        core._detached_roots = {top.id: top}
+
+        core._remove_leaf_from_parent(top)
+
+        self.assertIn(
+            endpoint.id,
+            core._detached_roots,
+            "the node below the freed top is no longer reachable from any "
+            "root, so the sanity walk cannot see it",
+        )
+
     def test_removing_a_leaf_clears_it_from_both_leaf_sets(self):
         """The choke point, tested directly.
 
@@ -1443,7 +1470,12 @@ class TestFreeingADetachedChain(CustomTestCase):
         core._delete_unbacked_device_leaf(nodes[1], {}, {}, {})
 
         self.assertNotIn(1, core._node_arena)
-        self.assertEqual(core._detached_roots, {})
+        # Node 2 hung off the freed top and is still in the arena, so it takes
+        # the top's place as the chain's anchor. Emptying _detached_roots here
+        # -- the old behaviour -- left it reachable from nothing, which is the
+        # stale device leaf sanity_check reports.
+        self.assertEqual(set(core._detached_roots), {2})
+        self.assertIn(2, core._node_arena)
 
     def test_freeing_it_never_evicts_a_node_that_took_its_place(self):
         """The anchor's child slot is reusable, and reuse must survive the reclaim.
