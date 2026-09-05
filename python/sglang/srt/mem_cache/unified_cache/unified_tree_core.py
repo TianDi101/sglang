@@ -2462,6 +2462,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
             E(f"  {self._describe_unreachable(stale, all_node_set)}")
 
+        stranded = self._nodes_out_of_the_walk(all_node_set)
+        if stranded:
+            E(
+                f"{len(stranded)} nodes in the arena the walk cannot reach: "
+                f"{[n.id for n in stranded[:5]]}"
+            )
+            E(f"  {self._describe_unreachable(stranded, all_node_set)}")
+
         # Per-component LRU tracking
         for ct in self.component_types:
             lru = self.lru_lists[ct]
@@ -2581,6 +2589,26 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             nodes.append(node)
             stack.extend(node.children.values())
         return nodes
+
+    def _nodes_out_of_the_walk(self, all_node_set) -> list[UnifiedTreeNode]:
+        """Arena nodes `_collect_all_nodes` cannot reach.
+
+        Every other check in `sanity_check` compares against `all_node_set`, so
+        a node that has fallen out of the walk is invisible to all of them
+        unless it also happens to sit in a leaf set. A node holding device slots
+        can therefore be dropped in total silence, and the first symptom is a
+        pool accounting mismatch a long way from the cause.
+
+        Deleting a node that still has a child is what strands one --
+        `_remove_leaf_from_parent` unregisters the parent while the child goes
+        on pointing at it. `invalidate_external_load_chain` declines for that
+        now; this reports it if anything else learns to.
+        """
+        return [
+            node
+            for node in self._node_arena.values()
+            if node not in all_node_set and node is not self.root_node
+        ]
 
     def _describe_unreachable(self, stale, all_node_set) -> str:
         """Say how each stale node fell out of the walk.

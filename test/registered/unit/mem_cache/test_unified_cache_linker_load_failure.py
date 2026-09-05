@@ -1743,5 +1743,62 @@ class TestTheReclaimNeverStrandsAChild(unittest.TestCase):
         self.assertNotIn(238, core._node_arena)
 
 
+class TestTheArenaIsComparedAgainstTheWalk(unittest.TestCase):
+    """`sanity_check` has to be able to see a stranded node at all.
+
+    Its other checks all compare against `_collect_all_nodes`, so a node that
+    has fallen out of that walk is invisible to every one of them unless it
+    also sits in a leaf set. The host-only child in the class above was caught
+    only by that accident; one holding device slots would have been dropped in
+    silence, surfacing much later as a pool accounting mismatch.
+    """
+
+    def _core(self, *nodes):
+        core = UnifiedTreeCore.__new__(UnifiedTreeCore)
+        core.root_node = _LeafNode(-1, device=False)
+        core._node_arena = {n.id: n for n in (core.root_node, *nodes)}
+        core._detached_roots = {}
+        return core
+
+    def test_a_reachable_tree_reports_nothing(self):
+        anchor = _LeafNode(184)
+        core = self._core(anchor)
+        walk = {core.root_node, anchor}
+
+        self.assertEqual(core._nodes_out_of_the_walk(walk), [])
+
+    def test_a_node_the_walk_misses_is_reported(self):
+        anchor = _LeafNode(184)
+        stranded = _LeafNode(300)
+        core = self._core(anchor, stranded)
+        walk = {core.root_node, anchor}
+
+        self.assertEqual(core._nodes_out_of_the_walk(walk), [stranded])
+
+    def test_the_root_is_never_reported(self):
+        """The root anchors the walk; it is not a stranded node."""
+        core = self._core()
+
+        self.assertEqual(core._nodes_out_of_the_walk(set()), [])
+
+    def test_reporting_a_stranded_node_does_not_itself_raise(self):
+        """`sanity_check` calls `_describe_unreachable` on whatever this finds.
+
+        That helper was written for leaf-set members, whose parent chain still
+        reaches something the walk holds. A stranded node's parent may be gone
+        entirely, and a reporter that throws on the state it is describing
+        would turn a diagnosable violation into a crash inside the crash.
+        """
+        orphan = _LeafNode(300)
+        orphan.parent = _LeafNode(238)  # a parent already deleted
+        core = self._core(orphan)
+        stranded = core._nodes_out_of_the_walk({core.root_node})
+
+        described = core._describe_unreachable(stranded, {core.root_node})
+
+        self.assertIn("node=300", described)
+        self.assertIn("X", described, "the dead parent should be marked")
+
+
 if __name__ == "__main__":
     unittest.main()
