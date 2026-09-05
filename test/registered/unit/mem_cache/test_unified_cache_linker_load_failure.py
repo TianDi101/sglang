@@ -426,6 +426,7 @@ class TestInvalidateExternalLoadChain(CustomTestCase):
             component_data = (_Component(),)
 
         node = _Node()
+        node.children = {}
         for key, value in overrides.items():
             setattr(node, key, value)
         return node
@@ -454,6 +455,21 @@ class TestInvalidateExternalLoadChain(CustomTestCase):
     def test_declines_when_the_node_is_not_a_device_leaf(self):
         """Covers a since-adopted chain: locked, or grown a device child."""
         core = self._core(self._node(), is_device_leaf=False)
+        self.assertFalse(core.invalidate_external_load_chain(7).is_dropped)
+        self.assertEqual(core.deleted, [])
+
+    def test_declines_for_any_child_not_only_a_device_bearing_one(self):
+        """`_is_device_leaf` is not a child check, so it cannot be the one here.
+
+        It only rejects children holding Full KV *on device*. A child that
+        holds host-only KV, or none, leaves the node looking free -- and
+        deleting it strands that child in the arena with a parent the tree no
+        longer holds, where no walk from the root or a detached root reaches it.
+        """
+        node = self._node()
+        node.children = {"tok": object()}
+        core = self._core(node, is_device_leaf=True)
+
         self.assertFalse(core.invalidate_external_load_chain(7).is_dropped)
         self.assertEqual(core.deleted, [])
 
@@ -1525,16 +1541,19 @@ class TestFreeingADetachedChain(CustomTestCase):
 class _LeafNode:
     """Enough node surface for the real leaf-set predicates."""
 
-    def __init__(self, node_id, parent=None, device=True):
+    def __init__(self, node_id, parent=None, device=True, host=False):
         self.id = node_id
         self.parent = parent
         self.detached = False
+        self.backuped = host
+        self.write_through_pending_id = None
+        self.load_back_pending_id = None
         self.key = FakeKey(node_id)
         self.children = {}
         self.component_data = (
             SimpleNamespace(
                 value=object() if device else None,
-                host_value=None,
+                host_value=object() if host else None,
                 lock_ref=0,
                 host_lock_ref=0,
             ),
@@ -1621,6 +1640,108 @@ class TestALeafSetNeverHoldsADeletedNode(unittest.TestCase):
         core._update_evictable_leaf_sets(end)
 
         self.assertIn(end, core.evictable_device_leaves)
+
+
+class TestTheReclaimNeverStrandsAChild(unittest.TestCase):
+    """The reclaim must not delete a node that still has a child.
+
+    `invalidate_external_load_chain` says it declines for a node something else
+    still owns -- "a child, a lock, a host copy" -- but the only child check it
+    had was `_is_device_leaf`, which rejects a child holding Full KV *on
+    device* and nothing else. A child that is host-only, or holds nothing at
+    all, left the node looking free.
+
+    Deleting it then unregisters the parent while the child keeps pointing at
+    it. `_collect_all_nodes` walks from the root and the detached roots, so it
+    never reaches that child again: it is stranded in the arena, and
+    `sanity_check` cannot even see it to complain. When the child is host-only
+    it is also still in `evictable_host_leaves`, and a leaf-set member the walk
+    cannot reach *is* reported -- as `stale nodes in host_leaves`, fatal under
+    the strict idle check.
+
+    Found by enumerating operation interleavings against the real code
+    (fixwork/order_search2.py), not by reading it.
+    """
+
+    def _core(self, child_kind):
+        core = UnifiedTreeCore.__new__(UnifiedTreeCore)
+        core.root_node = _LeafNode(-1, device=False)
+        core._detached_roots = {}
+        core.full_host_duplicates = {}
+        core.components = ()
+        core.components_by_type = {}
+        core.component_types = ()
+        core.page_size = 1
+        core.is_write_back = False
+        core.evictable_device_leaves = set()
+        core.evictable_host_leaves = set()
+        core.kv_events = SimpleNamespace(record_remove=lambda *a, **k: None)
+
+        anchor = _LeafNode(184, core.root_node)
+        top = _LeafNode(239, anchor)
+        end = _LeafNode(238, top)
+        child = _LeafNode(300, end, device=False, host=(child_kind == "host"))
+        core._node_arena = {
+            n.id: n for n in (core.root_node, anchor, top, end, child)
+        }
+        # what a failed load leaves behind: the chain cut out and anchored
+        for node in (top, end):
+            node.detached = True
+        anchor.children.pop(239)
+        core._detached_roots[239] = top
+        for node in (anchor, top, end, child):
+            core._update_evictable_leaf_sets(node)
+        return core, end, child
+
+    def _reachable(self, core):
+        stack = [core.root_node, *core._detached_roots.values()]
+        seen = set()
+        while stack:
+            node = stack.pop()
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            stack.extend(node.children.values())
+        return seen
+
+    def test_the_endpoint_looks_free_though_a_host_only_child_hangs_off_it(self):
+        """The enabling condition, stated on its own so it cannot drift."""
+        core, end, _child = self._core("host")
+
+        self.assertTrue(core._is_device_leaf(end))
+
+    def test_it_declines_rather_than_strand_a_host_only_child(self):
+        core, _end, child = self._core("host")
+        self.assertIn(child, core.evictable_host_leaves)
+
+        result = core.invalidate_external_load_chain(238)
+
+        self.assertFalse(result.is_dropped)
+        self.assertIn(id(child), self._reachable(core))
+        stale = [n for n in core.evictable_host_leaves
+                 if id(n) not in self._reachable(core)]
+        self.assertEqual(stale, [], "a leaf-set member the walk cannot reach")
+
+    def test_it_declines_rather_than_strand_an_empty_child(self):
+        """No leaf set names this child, so the only symptom is the leak."""
+        core, _end, child = self._core("empty")
+
+        result = core.invalidate_external_load_chain(238)
+
+        self.assertFalse(result.is_dropped)
+        self.assertIn(id(child), self._reachable(core))
+
+    def test_it_still_drops_the_endpoint_once_the_child_is_gone(self):
+        """Declining has to be a delay, not a refusal, or the chain leaks."""
+        core, end, child = self._core("host")
+        self.assertFalse(core.invalidate_external_load_chain(238).is_dropped)
+
+        # the child's owner releases and eviction takes it
+        core._remove_leaf_from_parent(child)
+
+        self.assertTrue(core.invalidate_external_load_chain(238).is_dropped)
+        self.assertNotIn(238, core._node_arena)
+
 
 if __name__ == "__main__":
     unittest.main()

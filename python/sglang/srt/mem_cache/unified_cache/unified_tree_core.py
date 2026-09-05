@@ -1510,6 +1510,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return result
         if any(cd.host_lock_ref > 0 for cd in node.component_data):
             return result
+        if node.children:
+            # A child is one of the owners this function already declines for,
+            # but the check below does not see every child: `_is_device_leaf`
+            # only rejects children holding Full KV *on device*, so a child
+            # with host-only KV -- or with none at all -- leaves the node
+            # looking free. Deleting it then unregisters the parent out from
+            # under that child, which keeps its parent pointer and stays in the
+            # arena while nothing reaches it any more: not from the root, and
+            # not from any detached root, so `_collect_all_nodes` never walks
+            # to it. A host-only child is worse than stranded, because it is
+            # still in `evictable_host_leaves`, and a leaf-set member the walk
+            # cannot reach is what sanity_check reports as `stale nodes in
+            # host_leaves` -- fatal under the strict idle check.
+            return result
         # Covers the lock_ref, device-child and evicted checks in one place.
         if not self._is_device_leaf(node):
             return result
