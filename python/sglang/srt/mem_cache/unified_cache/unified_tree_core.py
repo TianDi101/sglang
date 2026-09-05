@@ -17,7 +17,9 @@ cache for cache-level logic, but the TreeCore itself never touches it.
 from __future__ import annotations
 
 import logging
+import os
 import sys
+import traceback
 from array import array
 from collections import defaultdict
 from enum import Enum, auto
@@ -84,6 +86,13 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 logger = logging.getLogger(__name__)
+
+# Off by default: logs a stack every time a node the arena no longer holds is
+# put back into a leaf set. That is the shape of the `stale nodes in
+# device_leaves` crash, and the stack names the caller directly instead of
+# leaving it to be inferred by reading the call sites -- which produced three
+# wrong fixes for this crash before it was measured.
+SGLANG_DEBUG_LEAF_SET_READD = os.environ.get("SGLANG_DEBUG_LEAF_SET_READD", "0") == "1"
 
 # 42 bits: digest * 1000003 (< 2^20) stays under 2^62, so the update never
 # overflows int64 with plain (non-wrapping) arithmetic in the Rust port, and
@@ -572,7 +581,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _unregister_node(self, node: UnifiedTreeNode) -> None:
         """Drop a tree node from the arena."""
         self._node_arena.pop(node.id, None)
-        self._detached_roots.pop(node.id, None)
+        if self._detached_roots.pop(node.id, None) is not None:
+            # A detached chain is anchored in _detached_roots by its top node
+            # only; the rest hangs off it, and that is the sole way anything
+            # still reaches them -- the walk that collects every live node for
+            # the sanity check starts from the root and these roots.
+            #
+            # The chain is freed endpoint-first, from the bottom, so a node
+            # above can go while one below is still owned by a request that
+            # matched the chain before the load failed. Dropping this node
+            # without re-anchoring its children orphans them: still in the
+            # arena, still in the evictable leaf sets, unreachable from the
+            # walk -- which sanity_check reports as a stale device leaf.
+            for child in node.children.values():
+                self._detached_roots[child.id] = child
 
     def inc_lock_ref(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
@@ -1213,6 +1235,34 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
+        if (
+            SGLANG_DEBUG_LEAF_SET_READD
+            and self._node_arena.get(node.id) is not node
+            and (self._is_device_leaf(node) or self._is_host_leaf(node))
+        ):
+            # A node the arena no longer holds is about to go back into a leaf
+            # set, which is exactly the `stale nodes in device_leaves` crash.
+            # Name the caller rather than infer it -- reading the callers is
+            # what produced three wrong fixes for this.
+            logger.error(
+                "leaf-set re-add of unregistered node %s (detached=%s):\n%s",
+                node.id,
+                getattr(node, "detached", None),
+                "".join(traceback.format_stack(limit=12)),
+            )
+
+        if self._node_arena.get(node.id) is not node:
+            # A node the tree no longer holds never belongs in a leaf set.
+            # Callers reach one by passing `node.parent` after deleting a node,
+            # and a parent can already be gone: a chain endpoint counts as a
+            # device leaf while a child with no device KV still hangs off it,
+            # so it is freed first and that child's later deletion arrives here
+            # with a dead parent. Guarding at the single point that adds is the
+            # same argument as clearing at the single point that deletes.
+            self.evictable_device_leaves.discard(node)
+            self.evictable_host_leaves.discard(node)
+            return
+
         if self._is_device_leaf(node):
             self.evictable_device_leaves.add(node)
         else:
@@ -1413,6 +1463,34 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._detached_roots[top.id] = top
         return ids
 
+    def holds_detached_node(self, node_id: NodeId) -> bool:
+        """Whether the arena still holds this node.
+
+        A chain the reclaim gave up on is retried until it is freed, and a node
+        eviction reached first is simply gone -- there is nothing left to free
+        and nothing left to retry. Distinguishing that from "still owned" is
+        what keeps the retry list from growing without bound.
+        """
+        return node_id in self._node_arena
+
+    def is_on_detached_chain(self, node_id: NodeId) -> bool:
+        """Whether node_id hangs off a chain a failed load left cut out.
+
+        The chain's pages hold no KV, so anything still pointing into it is
+        pointing at KV that never arrived: the chain nodes themselves, and any
+        node a request built underneath one before the load's verdict landed.
+        Hence a walk to the root rather than a test of the node alone.
+
+        A detached node is unreachable from the root but keeps its own parent
+        pointer, so the walk still terminates at the root.
+        """
+        node = self._node_arena.get(node_id)
+        while node is not None and node is not self.root_node:
+            if node.detached:
+                return True
+            node = node.parent
+        return False
+
     def invalidate_external_load_chain(
         self, node_id: NodeId
     ) -> DropSubtreeNoHostResult:
@@ -1431,6 +1509,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if node.load_back_pending_id is not None:
             return result
         if any(cd.host_lock_ref > 0 for cd in node.component_data):
+            return result
+        if node.children:
+            # A child is one of the owners this function already declines for,
+            # but the check below does not see every child: `_is_device_leaf`
+            # only rejects children holding Full KV *on device*, so a child
+            # with host-only KV -- or with none at all -- leaves the node
+            # looking free. Deleting it then unregisters the parent out from
+            # under that child, which keeps its parent pointer and stays in the
+            # arena while nothing reaches it any more: not from the root, and
+            # not from any detached root, so `_collect_all_nodes` never walks
+            # to it. A host-only child is worse than stranded, because it is
+            # still in `evictable_host_leaves`, and a leaf-set member the walk
+            # cannot reach is what sanity_check reports as `stale nodes in
+            # host_leaves` -- fatal under the strict idle check.
             return result
         # Covers the lock_ref, device-child and evicted checks in one place.
         if not self._is_device_leaf(node):
@@ -1741,6 +1833,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             assert node.detached, f"node {node.id} is not its parent's child"
         # Deleted nodes must not linger in duplicate tracking as ghosts.
         self.full_host_duplicates.pop(node.id, None)
+        # Nor in the leaf sets. Every deletion passes through here, so this is
+        # the one place that cannot be forgotten -- and it has been, twice:
+        # both the tombstone cascade and _evict_host_leaf discarded only the
+        # host set before unregistering, leaving the device set pointing at a
+        # node that no longer exists. sanity_check reports that as
+        # `stale nodes in device_leaves`, and the strict idle check makes it
+        # fatal.
+        self.evictable_device_leaves.discard(node)
+        self.evictable_host_leaves.discard(node)
         self._unregister_node(node)
 
     def _evict_component_and_detach_lru(
@@ -2353,11 +2454,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             E(
                 f"{len(stale)} stale nodes in device_leaves: {[n.id for n in list(stale)[:5]]}"
             )
+            E(f"  {self._describe_unreachable(stale, all_node_set)}")
         stale = self.evictable_host_leaves - all_node_set
         if stale:
             E(
                 f"{len(stale)} stale nodes in host_leaves: {[n.id for n in list(stale)[:5]]}"
             )
+            E(f"  {self._describe_unreachable(stale, all_node_set)}")
+
+        stranded = self._nodes_out_of_the_walk(all_node_set)
+        if stranded:
+            E(
+                f"{len(stranded)} nodes in the arena the walk cannot reach: "
+                f"{[n.id for n in stranded[:5]]}"
+            )
+            E(f"  {self._describe_unreachable(stranded, all_node_set)}")
 
         # Per-component LRU tracking
         for ct in self.component_types:
@@ -2478,6 +2589,71 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             nodes.append(node)
             stack.extend(node.children.values())
         return nodes
+
+    def _nodes_out_of_the_walk(self, all_node_set) -> list[UnifiedTreeNode]:
+        """Arena nodes `_collect_all_nodes` cannot reach.
+
+        Every other check in `sanity_check` compares against `all_node_set`, so
+        a node that has fallen out of the walk is invisible to all of them
+        unless it also happens to sit in a leaf set. A node holding device slots
+        can therefore be dropped in total silence, and the first symptom is a
+        pool accounting mismatch a long way from the cause.
+
+        Deleting a node that still has a child is what strands one --
+        `_remove_leaf_from_parent` unregisters the parent while the child goes
+        on pointing at it. `invalidate_external_load_chain` declines for that
+        now; this reports it if anything else learns to.
+        """
+        return [
+            node
+            for node in self._node_arena.values()
+            if node not in all_node_set and node is not self.root_node
+        ]
+
+    def _describe_unreachable(self, stale, all_node_set) -> str:
+        """Say how each stale node fell out of the walk.
+
+        "in a leaf set but not reachable" is one fact with several possible
+        causes -- the node was unregistered and the set never told, or it is
+        still in the arena but nothing anchors it any more. Those want opposite
+        fixes, and the violation text alone does not separate them, which is
+        worth a few lines here rather than another round of guessing.
+        """
+        out = []
+        for node in list(stale)[:5]:
+            bits = [f"node={node.id}"]
+            bits.append(
+                "in_arena" if self._node_arena.get(node.id) is node else "NOT_in_arena"
+            )
+            bits.append(f"detached={getattr(node, 'detached', None)}")
+            bits.append(f"is_detached_root={node.id in self._detached_roots}")
+            # Climb until we hit something the walk reaches, or run out. Each
+            # ancestor reports arena membership too: whether the chain above a
+            # stale node is still held is the difference between "its anchor
+            # was freed" and "its anchor is still there and simply unlinked",
+            # and inferring that instead of printing it is how this gets
+            # misread.
+            chain, cur, hops = [], node.parent, 0
+            while cur is not None and hops < 12:
+                mark = "R" if cur in all_node_set else "-"
+                chain.append(
+                    f"{cur.id}{mark}"
+                    f"{'d' if getattr(cur, 'detached', False) else ''}"
+                    f"{'' if self._node_arena.get(cur.id) is cur else 'X'}"
+                )
+                if cur in all_node_set:
+                    break
+                cur, hops = cur.parent, hops + 1
+            if node.parent is None:
+                bits.append("parent=None")
+            else:
+                bits.append("up=" + ">".join(chain) if chain else "up=?")
+            out.append("(" + " ".join(bits) + ")")
+        return (
+            "provenance: "
+            + " ".join(out)
+            + "  [R=reached by walk, d=detached, X=not in arena]"
+        )
 
     def _check_lru_linked_list(
         self,

@@ -245,6 +245,12 @@ class UnifiedRadixCache(BasePrefixCache):
         # Requests whose external-linker load failed, awaiting the scheduler's
         # abort. Drained by drain_linker_loads().
         self._failed_linker_rids: list[str] = []
+        # Failed-load chains whose reclaim declined because someone other than
+        # the loading request still owned them, endpoint first. Retried by
+        # every later _reclaim_failed_linker_chain -- the chain is filed under
+        # one rid, but the owner that releases it last is the one that makes it
+        # free-able, and that is not necessarily the same request.
+        self._stranded_linker_nodes: list[NodeId] = []
         # Buffer-only host memory mode (host RAM as transient GPU↔storage
         # staging, not an L2 tier); resolved in init_hicache, which also
         # constructs the pipeline collaborator (None = cache mode).
@@ -353,6 +359,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.linker.reset()
         # The tree these referred to is about to go; nothing left to reclaim.
         self._failed_linker_rids.clear()
+        self._stranded_linker_nodes.clear()
         self._reset_full()
 
     def _reset_full(self) -> None:
@@ -2815,39 +2822,73 @@ class UnifiedRadixCache(BasePrefixCache):
             self._failed_linker_rids.extend(failed)
 
     def _reclaim_failed_linker_chain(self, rid: str) -> None:
-        """Free the tree chain a failed external-linker load published for rid.
+        """Free the tree chains a failed external-linker load published.
 
         Called from cache_finished_req once the request has dropped its tree
-        lock, which is the one point where the whole chain becomes
-        reclaimable: Full is a path-unlock, so that single dec_lock_ref clears
-        lock_ref on every node of the chain at once. A mid-chunk abort reaches
-        the same function later, through process_pending_chunked_abort.
+        lock. For the request that issued the load that is the one point where
+        its whole chain becomes reclaimable: Full is a path-unlock, so that
+        single dec_lock_ref clears lock_ref on every node of the chain at once.
+        A mid-chunk abort reaches the same function later, through
+        process_pending_chunked_abort.
 
         Endpoint-first, because a parent only becomes a device leaf once its
         child is gone.
 
-        A node something else still owns -- a request that matched the chain
-        before the load failed, a host copy, an in-flight DMA -- is left where
-        it is. It stays detached, so it can be neither matched nor written to
-        the store, and it keeps its LRU membership, so eviction reclaims it.
-        Retrying here would only poll for a release with no step bound.
+        The loading request is not always the last owner. A request that
+        matched the chain in the tree while the load was still in flight holds
+        it too, and it releases on its own schedule -- so a node that declines
+        here is kept and retried on every later pass rather than abandoned.
+        Abandoning it was not safe: the chain stays in the arena holding device
+        slots that no eviction is obliged to reach, while the request still
+        pointing into it goes on to insert those same slots under a fresh node,
+        leaving one set of pages owned twice.
+
+        A node that has left the arena is dropped instead of retried: eviction
+        reached it first, so there is nothing left to free.
         """
         if self.linker is None:
             return
+        pending = self._stranded_linker_nodes + self.linker.take_failed_chain(rid)
+        if not pending:
+            return
+        # Keep the endpoint-first order but name each node once: retrying is
+        # only bounded if the list cannot accumulate the same node twice.
+        pending = list(dict.fromkeys(pending))
+        self._stranded_linker_nodes = []
         stranded: list[NodeId] = []
-        for node_id in self.linker.take_failed_chain(rid):
+        for node_id in pending:
             result = self.tree_core.invalidate_external_load_chain(node_id)
             self._free_values(result.device_frees, result.host_frees)
-            if not result.is_dropped:
-                stranded.append(node_id)
+            if result.is_dropped:
+                continue
+            if not self.tree_core.holds_detached_node(node_id):
+                # Evicted out from under us; its slots are already back.
+                continue
+            stranded.append(node_id)
         if stranded:
-            logger.warning(
-                "Failed external-linker chain of %s is still owned elsewhere "
-                "at nodes %s; detached, so it cannot be matched -- its slots "
-                "are left to eviction",
-                rid,
+            self._stranded_linker_nodes = stranded
+            logger.debug(
+                "Failed external-linker chain at nodes %s is still owned "
+                "elsewhere; detached, so it cannot be matched -- retrying "
+                "when its other owner releases",
                 stranded,
             )
+
+    def has_outstanding_failed_linker_chains(self) -> bool:
+        """Whether any failed load's chain is still in the tree.
+
+        While one is, a request that never issued a load can still be holding
+        it, so the scheduler has to look for owners by where they point.
+        """
+        if self.linker is None:
+            return False
+        return bool(self._stranded_linker_nodes or self.linker.failed_chains)
+
+    def is_on_failed_linker_chain(self, node_id: Optional[NodeId]) -> bool:
+        """Whether a request anchored at node_id holds a failed load's pages."""
+        if self.linker is None or node_id is None:
+            return False
+        return self.tree_core.is_on_detached_chain(node_id)
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""

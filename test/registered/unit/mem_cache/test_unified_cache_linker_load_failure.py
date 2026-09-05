@@ -131,6 +131,9 @@ def _bare_core(arena=None, **overrides):
     core.page_size = 1
     core.components = ()
     core.full_host_duplicates = {}
+    # Deleting a node clears it from both leaf sets, so they have to exist.
+    core.evictable_device_leaves = set()
+    core.evictable_host_leaves = set()
     core.root_node = SimpleNamespace(id=-1, parent=None, children={})
     core._update_evictable_leaf_sets = lambda node: None
     for key, value in overrides.items():
@@ -423,6 +426,7 @@ class TestInvalidateExternalLoadChain(CustomTestCase):
             component_data = (_Component(),)
 
         node = _Node()
+        node.children = {}
         for key, value in overrides.items():
             setattr(node, key, value)
         return node
@@ -454,6 +458,21 @@ class TestInvalidateExternalLoadChain(CustomTestCase):
         self.assertFalse(core.invalidate_external_load_chain(7).is_dropped)
         self.assertEqual(core.deleted, [])
 
+    def test_declines_for_any_child_not_only_a_device_bearing_one(self):
+        """`_is_device_leaf` is not a child check, so it cannot be the one here.
+
+        It only rejects children holding Full KV *on device*. A child that
+        holds host-only KV, or none, leaves the node looking free -- and
+        deleting it strands that child in the arena with a parent the tree no
+        longer holds, where no walk from the root or a detached root reaches it.
+        """
+        node = self._node()
+        node.children = {"tok": object()}
+        core = self._core(node, is_device_leaf=True)
+
+        self.assertFalse(core.invalidate_external_load_chain(7).is_dropped)
+        self.assertEqual(core.deleted, [])
+
 
 class TestSchedulerMarkHook(CustomTestCase):
     """The scheduler side: mark the affected requests through ``to_finish``.
@@ -464,20 +483,34 @@ class TestSchedulerMarkHook(CustomTestCase):
     the free and the streaming.
     """
 
-    def _make_req(self, rid):
+    def _make_req(self, rid, last_node=None):
         req = MagicMock()
         req.rid = rid
+        req.last_node = last_node
         req.finished.return_value = False
         req.finished_reason = None
         req.to_finish = None
         req.skip_radix_cache_insert = False
         return req
 
-    def _run(self, failed_rids, batch_reqs, running_reqs=(), chunked_req=None):
+    def _run(
+        self,
+        failed_rids,
+        batch_reqs,
+        running_reqs=(),
+        chunked_req=None,
+        detached_nodes=(),
+    ):
         released = []
 
         tree_cache = MagicMock()
         tree_cache.drain_linker_loads.return_value = list(failed_rids)
+        tree_cache.has_outstanding_failed_linker_chains.return_value = bool(
+            detached_nodes
+        )
+        tree_cache.is_on_failed_linker_chain.side_effect = (
+            lambda node_id: node_id in set(detached_nodes)
+        )
 
         batch = MagicMock()
         batch.reqs = list(batch_reqs)
@@ -595,24 +628,93 @@ class TestSchedulerMarkHook(CustomTestCase):
         self.assertEqual(scheduler._deferred_linker_rids, {"rid-gone"})
 
 
-class TestReclaimFailedLinkerChain(CustomTestCase):
-    """The reclaim is keyed by rid and fires once, at the release point.
+class TestSchedulerAbortsChainCoOwners(CustomTestCase):
+    """A failed load's chain can be held by a request that issued no load.
 
-    ``cache_finished_req`` is the one place where the whole chain becomes
-    reclaimable: Full is a path-unlock, so the request's single
-    ``dec_lock_ref`` clears ``lock_ref`` on every node of the chain at once.
-    Nothing polls, so there is no attempt budget to tune -- a chain someone
-    else still owns is left to eviction, which reaches it because detaching
-    kept its LRU membership.
+    The chain goes into the tree before the transfer is verified, so a request
+    that arrives while the load is in flight matches it and is repointed onto
+    exactly those pages. It appears in no rid list -- the linker knows only the
+    rids it queued -- so naming is not enough to find it; it has to be found by
+    where it points. Left alone it is served KV that never arrived, at HTTP
+    200, which is the one outcome this whole path exists to prevent, and its
+    next ``cache_unfinished_req`` re-inserts the chain's pages under a fresh
+    node on top of that.
     """
 
-    def _cache(self, chains, drop_results):
+    _make_req = TestSchedulerMarkHook._make_req
+    _run = TestSchedulerMarkHook._run
+
+    def test_aborts_a_request_that_holds_a_chain_but_named_no_load(self):
+        loader = self._make_req("rid-a", last_node=5)
+        co_owner = self._make_req("rid-b", last_node=5)
+
+        _scheduler, released, _release_kv = self._run(
+            ["rid-a"], [loader, co_owner], detached_nodes=[5]
+        )
+
+        self.assertIsInstance(co_owner.to_finish, FINISH_ABORT)
+        self.assertTrue(co_owner.skip_radix_cache_insert)
+        self.assertCountEqual(released, ["rid-a", "rid-b"])
+
+    def test_leaves_a_request_that_points_somewhere_else_alone(self):
+        loader = self._make_req("rid-a", last_node=5)
+        elsewhere = self._make_req("rid-b", last_node=11)
+
+        self._run(["rid-a"], [loader, elsewhere], detached_nodes=[5])
+
+        self.assertIsNone(elsewhere.to_finish)
+
+    def test_a_co_owner_in_the_running_batch_is_found_too(self):
+        # It has already left the extend batch, and it is decoding over the
+        # pages the load never filled.
+        loader = self._make_req("rid-a", last_node=5)
+        co_owner = self._make_req("rid-b", last_node=5)
+
+        self._run(["rid-a"], [loader], running_reqs=[co_owner], detached_nodes=[5])
+
+        self.assertIsInstance(co_owner.to_finish, FINISH_ABORT)
+
+    def test_the_sweep_still_runs_when_no_new_load_failed(self):
+        # The verdict and the co-owner do not have to land in the same step:
+        # a chain detached earlier is still in the tree until its last owner
+        # releases, and a request can match it right up to that point.
+        co_owner = self._make_req("rid-b", last_node=5)
+
+        self._run([], [co_owner], detached_nodes=[5])
+
+        self.assertIsInstance(co_owner.to_finish, FINISH_ABORT)
+
+    def test_no_outstanding_chain_means_the_walk_is_never_run(self):
+        # The sweep costs a parent walk per request per step, so it must be
+        # gated on there being a chain to find owners of.
+        req = self._make_req("rid-a", last_node=5)
+
+        scheduler, _released, _release_kv = self._run(["rid-a"], [req])
+
+        self.assertFalse(scheduler.tree_cache.is_on_failed_linker_chain.called)
+
+
+class TestReclaimFailedLinkerChain(CustomTestCase):
+    """The reclaim is keyed by rid, and keeps what it could not free.
+
+    ``cache_finished_req`` is where the loading request's whole chain becomes
+    reclaimable: Full is a path-unlock, so that single ``dec_lock_ref`` clears
+    ``lock_ref`` on every node of the chain at once. But the loading request is
+    not always the last owner -- a request that matched the chain in the tree
+    while the load was still in flight holds it too -- so a node that declines
+    is carried to the next pass rather than abandoned. Nothing polls: the retry
+    rides on the next request to finish, and the list is empty in the ordinary
+    case.
+    """
+
+    def _cache(self, chains, drop_results, gone=()):
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.linker = MagicMock()
         cache.linker.take_failed_chain.side_effect = lambda rid: chains.pop(rid, [])
         cache._free_values = MagicMock()
+        cache._stranded_linker_nodes = []
 
         attempts = []
 
@@ -626,6 +728,9 @@ class TestReclaimFailedLinkerChain(CustomTestCase):
 
         cache.tree_core = MagicMock()
         cache.tree_core.invalidate_external_load_chain.side_effect = invalidate
+        cache.tree_core.holds_detached_node.side_effect = lambda node_id: (
+            node_id not in gone
+        )
         return cache, attempts
 
     def test_frees_the_whole_chain_endpoint_first(self):
@@ -652,17 +757,66 @@ class TestReclaimFailedLinkerChain(CustomTestCase):
 
         self.assertEqual(attempts, [])
 
-    def test_a_chain_someone_else_owns_is_left_to_eviction(self):
-        # Declining must not schedule a retry: the remaining owners -- a
-        # request that matched the chain before the load failed, a host copy,
-        # an in-flight DMA -- release on no step bound, and eviction already
-        # reaches a detached node.
-        cache, attempts = self._cache({"rid-a": [1]}, [False])
+    def test_a_chain_someone_else_owns_is_retried_until_it_is_freed(self):
+        # Abandoning it is not safe. The chain keeps its device slots while it
+        # sits in the arena, and the request still pointing into it goes on to
+        # insert those same slots under a fresh node -- one set of pages, two
+        # owners, which is the pool-accounting leak. Eviction is no answer
+        # either: a locked node is not a device leaf, so eviction skips it for
+        # exactly as long as the other owner holds it.
+        cache, attempts = self._cache({"rid-a": [1]}, [False, True])
 
         cache._reclaim_failed_linker_chain("rid-a")
+        self.assertEqual(cache._stranded_linker_nodes, [1])
+
+        # The other owner releases; the next request to finish frees it.
+        cache._reclaim_failed_linker_chain("rid-b")
+
+        self.assertEqual(attempts, [1, 1])
+        self.assertEqual(cache._stranded_linker_nodes, [])
+
+    def test_a_node_eviction_reached_first_leaves_the_retry_list(self):
+        # Otherwise the list grows without bound: the node is gone from the
+        # arena, so invalidate can never report it dropped.
+        cache, attempts = self._cache({"rid-a": [1]}, [False, False], gone={1})
+
         cache._reclaim_failed_linker_chain("rid-a")
 
-        self.assertEqual(attempts, [1], "the reclaim polled instead of giving up")
+        self.assertEqual(attempts, [1])
+        self.assertEqual(cache._stranded_linker_nodes, [])
+
+    def test_the_retry_list_is_bounded(self):
+        # Switching from "give up" to "retry" is only safe if the list cannot
+        # grow: a node that stays owned is retried on every finishing request,
+        # so naming it twice would accumulate a pass per duplicate.
+        cache, attempts = self._cache({"rid-a": [1]}, [False] * 50)
+
+        cache._reclaim_failed_linker_chain("rid-a")
+        for i in range(20):
+            cache._reclaim_failed_linker_chain(f"rid-{i}")
+
+        self.assertEqual(cache._stranded_linker_nodes, [1])
+        self.assertEqual(len(attempts), 21, "one attempt per pass, no more")
+
+    def test_the_same_node_is_never_retried_twice_in_one_pass(self):
+        cache, attempts = self._cache({"rid-a": [4], "rid-b": [4]}, [False] * 4)
+
+        cache._reclaim_failed_linker_chain("rid-a")
+        cache._reclaim_failed_linker_chain("rid-b")
+
+        self.assertEqual(cache._stranded_linker_nodes, [4])
+
+    def test_a_retry_is_attempted_before_a_freshly_failed_chain(self):
+        # Endpoint-first ordering is what makes a chain free-able at all, and
+        # an older chain's endpoint is not below a newer one.
+        cache, attempts = self._cache(
+            {"rid-a": [1], "rid-b": [9, 8]}, [False, True, True, True]
+        )
+
+        cache._reclaim_failed_linker_chain("rid-a")
+        cache._reclaim_failed_linker_chain("rid-b")
+
+        self.assertEqual(attempts, [1, 1, 9, 8])
 
 
 class TestCacheFinishedReqReclaimsAfterTheUnlock(CustomTestCase):
@@ -1114,6 +1268,197 @@ class TestDetachExternalLoadChain(CustomTestCase):
         self.assertEqual(core._detached_roots, {})
 
 
+class TestOwnershipOfADetachedChain(CustomTestCase):
+    """The two tree-core probes the reclaim and the sweep are built on."""
+
+    def _core(self, nodes, root):
+        core = UnifiedTreeCore.__new__(UnifiedTreeCore)
+        core._node_arena = {n.id: n for n in nodes}
+        core.root_node = root
+        return core
+
+    def _node(self, node_id, parent=None, detached=False):
+        class _Node:
+            pass
+
+        node = _Node()
+        node.id = node_id
+        node.parent = parent
+        node.detached = detached
+        return node
+
+    def test_a_node_on_the_chain_is_on_the_chain(self):
+        root = self._node(0)
+        top = self._node(1, parent=root, detached=True)
+        core = self._core([root, top], root)
+
+        self.assertTrue(core.is_on_detached_chain(1))
+
+    def test_a_node_built_under_the_chain_is_on_it_too(self):
+        # A request that matched the chain and then extended it owns a node
+        # the detach never touched, hanging off one that it did. Its pages are
+        # its own, but its prefix is the chain's.
+        root = self._node(0)
+        top = self._node(1, parent=root, detached=True)
+        below = self._node(2, parent=top)
+        core = self._core([root, top, below], root)
+
+        self.assertTrue(core.is_on_detached_chain(2))
+
+    def test_an_ordinary_node_is_not(self):
+        root = self._node(0)
+        node = self._node(1, parent=root)
+        core = self._core([root, node], root)
+
+        self.assertFalse(core.is_on_detached_chain(1))
+
+    def test_the_root_is_not(self):
+        root = self._node(0)
+
+        self.assertFalse(self._core([root], root).is_on_detached_chain(0))
+
+    def test_a_node_that_is_gone_is_not(self):
+        root = self._node(0)
+
+        self.assertFalse(self._core([root], root).is_on_detached_chain(99))
+
+    def test_holds_detached_node_follows_the_arena(self):
+        root = self._node(0)
+        node = self._node(1, parent=root, detached=True)
+        core = self._core([root, node], root)
+
+        self.assertTrue(core.holds_detached_node(1))
+        self.assertFalse(core.holds_detached_node(99))
+
+
+class TestTombstoneCascadeLeavesNoStaleLeaf(CustomTestCase):
+    """The cascade must drop a node from *both* leaf sets when it deletes it.
+
+    ``_release_all_component_layers`` discards the device set and the host set
+    together; the cascade's own delete discarded only the host one. A node left
+    in ``evictable_device_leaves`` after its arena entry is gone is what
+    ``sanity_check`` reports as ``stale nodes in device_leaves``, and the strict
+    idle check turns that into a crash -- observed on all 8 ranks of a DSv4-Pro
+    run once the earlier failures stopped ending the process first.
+
+    The cascade reaches such a node through a failed load: it walks
+    ``deleted.parent``, and the parent of a request's own node can be a
+    detached chain node, which the ``has_device`` branch adds to the device set
+    on the way past.
+    """
+
+    def _core(self, cur, parent, root):
+        core = UnifiedTreeCore.__new__(UnifiedTreeCore)
+        core.root_node = root
+        core._node_arena = {n.id: n for n in (cur, parent, root)}
+        core._detached_roots = {}
+        core.full_host_duplicates = {}
+        core.components = ()
+        core.components_by_type = {}
+        core.page_size = 1
+        core.evictable_device_leaves = {cur}
+        core.evictable_host_leaves = set()
+        core._update_evictable_leaf_sets = lambda node: None
+        return core
+
+    def _node(self, node_id, parent=None, detached=False):
+        class _Key:
+            def child_key(self, page_size):
+                return node_id
+
+        class _Data:
+            value = None
+            host_value = None
+            lock_ref = 0
+            host_lock_ref = 0
+
+        class _Node:
+            pass
+
+        node = _Node()
+        node.id = node_id
+        node.parent = parent
+        node.detached = detached
+        node.key = _Key()
+        node.children = {}
+        node.component_data = (_Data(),)
+        if parent is not None:
+            parent.children[node_id] = node
+        return node
+
+    def test_freeing_a_detached_root_re_anchors_what_hung_off_it(self):
+        """The chain must stay reachable while any of it survives.
+
+        ``_detached_roots`` anchors a detached chain by its top node only; the
+        rest hangs off it, and sanity_check's walk (root plus those roots) is
+        the only thing that reaches them. The chain frees endpoint-first, from
+        the bottom, so a node above can go while one below is still owned by a
+        request that matched the chain before the load failed -- orphaning it
+        in the arena and in the leaf sets, invisible to the walk. That is the
+        ``D-leaf extra`` / ``stale nodes in device_leaves`` pair.
+        """
+        root = FakeNode(0)
+        top = FakeNode(1, root)
+        endpoint = FakeNode(2, top)
+        top.detached = endpoint.detached = True
+        core = _bare_core({0: root, 1: top, 2: endpoint})
+        core._detached_roots = {top.id: top}
+
+        core._remove_leaf_from_parent(top)
+
+        self.assertIn(
+            endpoint.id,
+            core._detached_roots,
+            "the node below the freed top is no longer reachable from any "
+            "root, so the sanity walk cannot see it",
+        )
+
+    def test_removing_a_leaf_clears_it_from_both_leaf_sets(self):
+        """The choke point, tested directly.
+
+        Every deletion goes through ``_remove_leaf_from_parent``. Two callers
+        had each independently discarded only the host set -- the tombstone
+        cascade and ``_evict_host_leaf`` -- so the rule belongs here rather
+        than in each caller, where it has now been forgotten twice.
+        """
+        parent = FakeNode(0)
+        node = FakeNode(1, parent)
+        node.detached = True
+        core = _bare_core({0: parent, 1: node})
+        core._detached_roots = {1: node}
+        core.evictable_device_leaves = {node}
+        core.evictable_host_leaves = {node}
+
+        core._remove_leaf_from_parent(node)
+
+        self.assertEqual(core.evictable_device_leaves, set())
+        self.assertEqual(core.evictable_host_leaves, set())
+        self.assertNotIn(1, core._node_arena)
+
+    def test_a_cascade_deleted_node_does_not_stay_in_device_leaves(self):
+        root = self._node(0)
+        parent = self._node(1, parent=root)
+        # `cur`: no value on either layer, so the cascade deletes it -- and it
+        # is in the device set, which is the state the has_device branch and a
+        # detached chain node produce together.
+        cur = self._node(2, parent=parent, detached=True)
+        deleted = self._node(3, parent=cur)
+        cur.children.pop(3)
+        core = self._core(cur, parent, root)
+
+        core._iteratively_delete_tombstone_leaf(
+            deleted, tracker={}, device_frees={}, host_frees={}
+        )
+
+        self.assertNotIn(
+            2,
+            [n.id for n in core.evictable_device_leaves],
+            "the cascade unregistered the node but left the device-leaf set "
+            "pointing at it -- sanity_check reports that as a stale entry",
+        )
+        self.assertNotIn(2, core._node_arena, "the node should have been deleted")
+
+
 class TestFreeingADetachedChain(CustomTestCase):
     """A detached node is off the tree, so the free must not assume otherwise."""
 
@@ -1141,7 +1486,12 @@ class TestFreeingADetachedChain(CustomTestCase):
         core._delete_unbacked_device_leaf(nodes[1], {}, {}, {})
 
         self.assertNotIn(1, core._node_arena)
-        self.assertEqual(core._detached_roots, {})
+        # Node 2 hung off the freed top and is still in the arena, so it takes
+        # the top's place as the chain's anchor. Emptying _detached_roots here
+        # -- the old behaviour -- left it reachable from nothing, which is the
+        # stale device leaf sanity_check reports.
+        self.assertEqual(set(core._detached_roots), {2})
+        self.assertIn(2, core._node_arena)
 
     def test_freeing_it_never_evicts_a_node_that_took_its_place(self):
         """The anchor's child slot is reusable, and reuse must survive the reclaim.
@@ -1184,6 +1534,265 @@ class TestFreeingADetachedChain(CustomTestCase):
 
         with self.assertRaises(AssertionError):
             core._remove_leaf_from_parent(nodes[1])
+
+
+class _LeafNode:
+    """Enough node surface for the real leaf-set predicates."""
+
+    def __init__(self, node_id, parent=None, device=True, host=False):
+        self.id = node_id
+        self.parent = parent
+        self.detached = False
+        self.backuped = host
+        self.write_through_pending_id = None
+        self.load_back_pending_id = None
+        self.key = FakeKey(node_id)
+        self.children = {}
+        self.component_data = (
+            SimpleNamespace(
+                value=object() if device else None,
+                host_value=object() if host else None,
+                lock_ref=0,
+                host_lock_ref=0,
+            ),
+        )
+        if parent is not None:
+            parent.children[node_id] = self
+
+    @property
+    def evicted(self):
+        return self.component_data[0].value is None
+
+
+class TestALeafSetNeverHoldsADeletedNode(unittest.TestCase):
+    """A node the arena no longer holds must not be in a leaf set.
+
+    The crash this pins reads
+
+        D-leaf extra: [N]
+        1 stale nodes in device_leaves: [N]
+
+    and `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE` (default True) makes it
+    fatal. Deleting a node clears it from both sets; what put it back is
+    `_update_evictable_leaf_sets(parent)`, which several callers reach after a
+    delete -- and the parent can already be gone.
+
+    A failed load is what makes that reachable. A detached chain's endpoint
+    counts as a device leaf while a child holding no device KV still hangs off
+    it (`_is_device_leaf` only rejects children with Full KV *on device*), so
+    the endpoint is freed first, and that child's later deletion arrives here
+    naming a parent that is no longer in the tree.
+    """
+
+    def _core(self):
+        core = UnifiedTreeCore.__new__(UnifiedTreeCore)
+        core.root_node = _LeafNode(-1, device=False)
+        core._detached_roots = {}
+        core.full_host_duplicates = {}
+        core.components = ()
+        core.components_by_type = {}
+        core.component_types = ()
+        core.page_size = 1
+        core.is_write_back = False
+        core.evictable_device_leaves = set()
+        core.evictable_host_leaves = set()
+        # anchor <- top <- endpoint <- a node built under the chain
+        anchor = _LeafNode(184, core.root_node)
+        top = _LeafNode(239, anchor)
+        end = _LeafNode(238, top)
+        child = _LeafNode(300, end, device=False)
+        core._node_arena = {n.id: n for n in (core.root_node, anchor, top, end, child)}
+        return core, anchor, top, end, child
+
+    def test_the_endpoint_is_a_device_leaf_while_a_child_hangs_off_it(self):
+        """The enabling condition, stated on its own so it cannot drift."""
+        core, _anchor, _top, end, _child = self._core()
+
+        self.assertTrue(core._is_device_leaf(end))
+
+    def test_a_deleted_parent_is_not_put_back_when_its_child_goes(self):
+        core, _anchor, _top, end, child = self._core()
+        core._update_evictable_leaf_sets(end)
+        self.assertIn(end, core.evictable_device_leaves)
+
+        # The endpoint is freed while the child still hangs off it.
+        core._remove_leaf_from_parent(end)
+        self.assertNotIn(238, core._node_arena)
+        # Now the child goes, and its parent is named to be re-evaluated.
+        core._update_evictable_leaf_sets(child.parent)
+
+        self.assertNotIn(end, core.evictable_device_leaves)
+        self.assertNotIn(end, core.evictable_host_leaves)
+
+    def test_a_node_still_in_the_tree_is_unaffected(self):
+        """The guard keys on arena membership, not on the detached flag.
+
+        The endpoint is detached and qualifies as a device leaf; for as long as
+        the arena holds it, it belongs in the set.
+        """
+        core, _anchor, _top, end, _child = self._core()
+        end.detached = True
+
+        core._update_evictable_leaf_sets(end)
+
+        self.assertIn(end, core.evictable_device_leaves)
+
+
+class TestTheReclaimNeverStrandsAChild(unittest.TestCase):
+    """The reclaim must not delete a node that still has a child.
+
+    `invalidate_external_load_chain` says it declines for a node something else
+    still owns -- "a child, a lock, a host copy" -- but the only child check it
+    had was `_is_device_leaf`, which rejects a child holding Full KV *on
+    device* and nothing else. A child that is host-only, or holds nothing at
+    all, left the node looking free.
+
+    Deleting it then unregisters the parent while the child keeps pointing at
+    it. `_collect_all_nodes` walks from the root and the detached roots, so it
+    never reaches that child again: it is stranded in the arena, and
+    `sanity_check` cannot even see it to complain. When the child is host-only
+    it is also still in `evictable_host_leaves`, and a leaf-set member the walk
+    cannot reach *is* reported -- as `stale nodes in host_leaves`, fatal under
+    the strict idle check.
+
+    Found by enumerating operation interleavings against the real code
+    (fixwork/order_search2.py), not by reading it.
+    """
+
+    def _core(self, child_kind):
+        core = UnifiedTreeCore.__new__(UnifiedTreeCore)
+        core.root_node = _LeafNode(-1, device=False)
+        core._detached_roots = {}
+        core.full_host_duplicates = {}
+        core.components = ()
+        core.components_by_type = {}
+        core.component_types = ()
+        core.page_size = 1
+        core.is_write_back = False
+        core.evictable_device_leaves = set()
+        core.evictable_host_leaves = set()
+        core.kv_events = SimpleNamespace(record_remove=lambda *a, **k: None)
+
+        anchor = _LeafNode(184, core.root_node)
+        top = _LeafNode(239, anchor)
+        end = _LeafNode(238, top)
+        child = _LeafNode(300, end, device=False, host=(child_kind == "host"))
+        core._node_arena = {n.id: n for n in (core.root_node, anchor, top, end, child)}
+        # what a failed load leaves behind: the chain cut out and anchored
+        for node in (top, end):
+            node.detached = True
+        anchor.children.pop(239)
+        core._detached_roots[239] = top
+        for node in (anchor, top, end, child):
+            core._update_evictable_leaf_sets(node)
+        return core, end, child
+
+    def _reachable(self, core):
+        stack = [core.root_node, *core._detached_roots.values()]
+        seen = set()
+        while stack:
+            node = stack.pop()
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            stack.extend(node.children.values())
+        return seen
+
+    def test_the_endpoint_looks_free_though_a_host_only_child_hangs_off_it(self):
+        """The enabling condition, stated on its own so it cannot drift."""
+        core, end, _child = self._core("host")
+
+        self.assertTrue(core._is_device_leaf(end))
+
+    def test_it_declines_rather_than_strand_a_host_only_child(self):
+        core, _end, child = self._core("host")
+        self.assertIn(child, core.evictable_host_leaves)
+
+        result = core.invalidate_external_load_chain(238)
+
+        self.assertFalse(result.is_dropped)
+        self.assertIn(id(child), self._reachable(core))
+        stale = [
+            n for n in core.evictable_host_leaves if id(n) not in self._reachable(core)
+        ]
+        self.assertEqual(stale, [], "a leaf-set member the walk cannot reach")
+
+    def test_it_declines_rather_than_strand_an_empty_child(self):
+        """No leaf set names this child, so the only symptom is the leak."""
+        core, _end, child = self._core("empty")
+
+        result = core.invalidate_external_load_chain(238)
+
+        self.assertFalse(result.is_dropped)
+        self.assertIn(id(child), self._reachable(core))
+
+    def test_it_still_drops_the_endpoint_once_the_child_is_gone(self):
+        """Declining has to be a delay, not a refusal, or the chain leaks."""
+        core, end, child = self._core("host")
+        self.assertFalse(core.invalidate_external_load_chain(238).is_dropped)
+
+        # the child's owner releases and eviction takes it
+        core._remove_leaf_from_parent(child)
+
+        self.assertTrue(core.invalidate_external_load_chain(238).is_dropped)
+        self.assertNotIn(238, core._node_arena)
+
+
+class TestTheArenaIsComparedAgainstTheWalk(unittest.TestCase):
+    """`sanity_check` has to be able to see a stranded node at all.
+
+    Its other checks all compare against `_collect_all_nodes`, so a node that
+    has fallen out of that walk is invisible to every one of them unless it
+    also sits in a leaf set. The host-only child in the class above was caught
+    only by that accident; one holding device slots would have been dropped in
+    silence, surfacing much later as a pool accounting mismatch.
+    """
+
+    def _core(self, *nodes):
+        core = UnifiedTreeCore.__new__(UnifiedTreeCore)
+        core.root_node = _LeafNode(-1, device=False)
+        core._node_arena = {n.id: n for n in (core.root_node, *nodes)}
+        core._detached_roots = {}
+        return core
+
+    def test_a_reachable_tree_reports_nothing(self):
+        anchor = _LeafNode(184)
+        core = self._core(anchor)
+        walk = {core.root_node, anchor}
+
+        self.assertEqual(core._nodes_out_of_the_walk(walk), [])
+
+    def test_a_node_the_walk_misses_is_reported(self):
+        anchor = _LeafNode(184)
+        stranded = _LeafNode(300)
+        core = self._core(anchor, stranded)
+        walk = {core.root_node, anchor}
+
+        self.assertEqual(core._nodes_out_of_the_walk(walk), [stranded])
+
+    def test_the_root_is_never_reported(self):
+        """The root anchors the walk; it is not a stranded node."""
+        core = self._core()
+
+        self.assertEqual(core._nodes_out_of_the_walk(set()), [])
+
+    def test_reporting_a_stranded_node_does_not_itself_raise(self):
+        """`sanity_check` calls `_describe_unreachable` on whatever this finds.
+
+        That helper was written for leaf-set members, whose parent chain still
+        reaches something the walk holds. A stranded node's parent may be gone
+        entirely, and a reporter that throws on the state it is describing
+        would turn a diagnosable violation into a crash inside the crash.
+        """
+        orphan = _LeafNode(300)
+        orphan.parent = _LeafNode(238)  # a parent already deleted
+        core = self._core(orphan)
+        stranded = core._nodes_out_of_the_walk({core.root_node})
+
+        described = core._describe_unreachable(stranded, {core.root_node})
+
+        self.assertIn("node=300", described)
+        self.assertIn("X", described, "the dead parent should be marked")
 
 
 if __name__ == "__main__":

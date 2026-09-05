@@ -22,6 +22,9 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
+from sglang.srt.mem_cache.unified_cache.linker_fault_injection import (
+    arm_load_failure_injection,
+)
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 from sglang.srt.mem_cache.utils import hash_str_to_int64
 from sglang.srt.runtime_context import get_memory, get_model
@@ -255,6 +258,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         tp_rank = 0
         if distributed:
             tp_rank = torch.distributed.get_rank(group=params.tp_cache_group)
+        self.tp_rank = tp_rank
         self.pool_group = resolve_hybrid_device_pool_group(
             kvcache=kvcache,
             page_size=self.page_size,
@@ -850,6 +854,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     def _run_layer_wise_batch(
         self, counter_index: int, plans: list[_PoolRangePlan]
     ) -> bool:
+        maybe_fail = arm_load_failure_injection(self.tp_rank)
         try:
             by_layer: dict[int, list[_PoolRangePlan]] = defaultdict(list)
             for plan in plans:
@@ -863,9 +868,15 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         continue
                     ptrs, sizes, offsets = meta
                     step = self._entries_per_call(sizes)
+                    where = (
+                        f"layer={group[0]}"
+                        if len(group) == 1
+                        else f"layers={group[0]}..{group[-1]}"
+                    )
                     for start in range(0, len(plan.keys), step):
                         end = start + step
                         chunk_keys = plan.keys[start:end]
+                        maybe_fail(plan.name, where)
                         results = list(
                             self.storage.client.batch_get_ranges_into_ptr(
                                 chunk_keys,
@@ -875,11 +886,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                             )
                         )
                         if len(results) != len(chunk_keys) or not all(results):
-                            where = (
-                                f"layer={group[0]}"
-                                if len(group) == 1
-                                else f"layers={group[0]}..{group[-1]}"
-                            )
                             raise RuntimeError(
                                 f"UMBP get failed for pool={plan.name}, {where}: "
                                 f"success={sum(bool(value) for value in results)}/"

@@ -4184,7 +4184,14 @@ class Scheduler(
         deferred = self._deferred_linker_rids
         self._deferred_linker_rids = set()
         failed = set(self.tree_cache.drain_linker_loads()) | deferred
-        if not failed:
+        # The request that issued the load is not the only one that can be
+        # holding its pages. A request that matched the chain in the tree while
+        # the load was still in flight was repointed onto exactly those pages,
+        # and it issued no load of its own, so it appears in no rid list -- it
+        # has to be found by where it points. Serving it is serving KV that
+        # never arrived, which is the one outcome this path exists to prevent.
+        sweep_chains = self.tree_cache.has_outstanding_failed_linker_chains()
+        if not failed and not sweep_chains:
             return
         message = "Aborted: external KV cache load failed."
         # The verdict is MIN-reduced, so a lagging rank can defer it past the
@@ -4194,9 +4201,15 @@ class Scheduler(
         if self.running_batch is not None and not self.running_batch.is_empty():
             candidates.extend(self.running_batch.reqs)
         for req in candidates:
-            if req.rid not in failed:
+            if req.rid in failed:
+                failed.discard(req.rid)
+            elif not (
+                sweep_chains
+                and self.tree_cache.is_on_failed_linker_chain(
+                    getattr(req, "last_node", None)
+                )
+            ):
                 continue
-            failed.discard(req.rid)
             if req.finished() or req.to_finish is not None:
                 continue
             # Never finished_reason here: a request finished ahead of the
