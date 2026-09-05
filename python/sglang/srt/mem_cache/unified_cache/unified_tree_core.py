@@ -2623,9 +2623,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for node in list(stale)[:5]:
             bits = [f"node={node.id}"]
             bits.append(
-                "in_arena"
-                if self._node_arena.get(node.id) is node
-                else "NOT_in_arena"
+                "in_arena" if self._node_arena.get(node.id) is node else "NOT_in_arena"
             )
             bits.append(f"detached={getattr(node, 'detached', None)}")
             bits.append(f"is_detached_root={node.id in self._detached_roots}")

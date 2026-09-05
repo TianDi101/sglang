@@ -1536,8 +1536,6 @@ class TestFreeingADetachedChain(CustomTestCase):
             core._remove_leaf_from_parent(nodes[1])
 
 
-
-
 class _LeafNode:
     """Enough node surface for the real leaf-set predicates."""
 
@@ -1603,9 +1601,7 @@ class TestALeafSetNeverHoldsADeletedNode(unittest.TestCase):
         top = _LeafNode(239, anchor)
         end = _LeafNode(238, top)
         child = _LeafNode(300, end, device=False)
-        core._node_arena = {
-            n.id: n for n in (core.root_node, anchor, top, end, child)
-        }
+        core._node_arena = {n.id: n for n in (core.root_node, anchor, top, end, child)}
         return core, anchor, top, end, child
 
     def test_the_endpoint_is_a_device_leaf_while_a_child_hangs_off_it(self):
@@ -1681,9 +1677,7 @@ class TestTheReclaimNeverStrandsAChild(unittest.TestCase):
         top = _LeafNode(239, anchor)
         end = _LeafNode(238, top)
         child = _LeafNode(300, end, device=False, host=(child_kind == "host"))
-        core._node_arena = {
-            n.id: n for n in (core.root_node, anchor, top, end, child)
-        }
+        core._node_arena = {n.id: n for n in (core.root_node, anchor, top, end, child)}
         # what a failed load leaves behind: the chain cut out and anchored
         for node in (top, end):
             node.detached = True
@@ -1718,8 +1712,9 @@ class TestTheReclaimNeverStrandsAChild(unittest.TestCase):
 
         self.assertFalse(result.is_dropped)
         self.assertIn(id(child), self._reachable(core))
-        stale = [n for n in core.evictable_host_leaves
-                 if id(n) not in self._reachable(core)]
+        stale = [
+            n for n in core.evictable_host_leaves if id(n) not in self._reachable(core)
+        ]
         self.assertEqual(stale, [], "a leaf-set member the walk cannot reach")
 
     def test_it_declines_rather_than_strand_an_empty_child(self):
