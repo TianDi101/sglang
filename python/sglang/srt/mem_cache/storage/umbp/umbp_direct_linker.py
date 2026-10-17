@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from collections import defaultdict
+import time
+from collections import defaultdict, deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from queue import Empty, Queue
@@ -36,6 +37,9 @@ device_module = get_device_module()
 # Keep every control-plane RPC comfortably below gRPC's message-size limit.
 # This is a logical-page count; existence queries carry keys only, no ranges.
 CHUNK_PAGES = 64
+
+# Log per-load-batch GPU stalls and group timings (measurement only).
+LW_STATS = os.getenv("UMBP_LW_STATS", "0") == "1"
 
 # Budget by ranges because pool layouts attach different counts per object;
 # 8192 stays below gRPC's default message limit.
@@ -87,6 +91,11 @@ class LayerWiseLoadCounter:
         self._producer_index = -1
         self.consumer_index = -1
         self._futures: dict[int, list[Future]] = {}
+        # LW_STATS: blocked layers per batch, the batch's load info, and
+        # finished batches whose GPU events are not yet resolved.
+        self._blocked: dict[int, list] = {}
+        self.load_info: dict[int, dict] = {}
+        self._reports: deque = deque()
 
     def update_producer(self) -> int:
         self._producer_index += 1
@@ -110,17 +119,63 @@ class LayerWiseLoadCounter:
         if futures is None:
             return
         try:
-            futures[threshold].result()
+            if LW_STATS and not futures[threshold].done():
+                self._timed_wait(index, threshold, futures[threshold])
+            else:
+                futures[threshold].result()
         except BaseException as error:
             raise RuntimeError("UMBP layer-wise KV load failed.") from error
         finally:
             if threshold == self.num_layers - 1:
                 self._futures.pop(index, None)
+                if LW_STATS:
+                    self._reports.append((index, self._blocked.pop(index, [])))
+                    self._flush_reports()
+
+    def _timed_wait(self, index: int, layer: int, future: Future) -> None:
+        # Events bracket the wait on the forward stream: their gap is how long
+        # the GPU sat idle for this layer, not how long the CPU waited.
+        before = device_module.Event(enable_timing=True)
+        before.record()
+        start = time.perf_counter()
+        future.result()
+        cpu_ms = (time.perf_counter() - start) * 1e3
+        after = device_module.Event(enable_timing=True)
+        after.record()
+        self._blocked.setdefault(index, []).append((layer, before, after, cpu_ms))
+
+    def _flush_reports(self) -> None:
+        while self._reports:
+            index, blocked = self._reports[0]
+            if blocked and not blocked[-1][2].query():
+                return
+            self._reports.popleft()
+            info = self.load_info.pop(index, {})
+            gpu = [b.elapsed_time(a) for _, b, a, _ in blocked]
+            logger.info(
+                "UMBPLW idx=%d stall_gpu_ms=%.1f stall_cpu_ms=%.1f blocked=%d "
+                "first_blocked=%s worst=%s ready_ms=%.1f grp_ms=%s reqs=%s "
+                "keys=%s bytes=%s",
+                index,
+                sum(gpu),
+                sum(cpu for *_, cpu in blocked),
+                len(blocked),
+                blocked[0][0] if blocked else -1,
+                f"{blocked[gpu.index(max(gpu))][0]}:{max(gpu):.1f}" if gpu else "-",
+                info.get("ready_ms", -1.0),
+                info.get("grp_ms", []),
+                info.get("reqs", {}),
+                info.get("keys", {}),
+                info.get("bytes", {}),
+            )
 
     def reset(self) -> None:
         self._producer_index = -1
         self.consumer_index = -1
         self._futures.clear()
+        self._blocked.clear()
+        self.load_info.clear()
+        self._reports.clear()
 
 
 @dataclass
@@ -565,6 +620,17 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         ready_event = device_module.Event()
         ready_event.record()
         counter_index = self.layer_done_counter.update_producer()
+        if LW_STATS:
+            # A request with no KV transfer only restores side state (e.g. SWA)
+            # for a prefix that already hit in HBM.
+            kv = sum(
+                any(t.name == PoolName.KV and t.keys for t in transfers)
+                for transfers in pending.values()
+            )
+            self.layer_done_counter.load_info[counter_index] = {
+                "reqs": {"kv": kv, "side_only": len(pending) - kv},
+                "keys": {plan.name.name: len(plan.keys) for plan in plans},
+            }
         self._load_queue.put((counter_index, rids, plans, ready_event))
         self._pending = {}
         self._stats["load"] += len(pending)
@@ -846,19 +912,26 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self, counter_index: int, plans: list[_PoolRangePlan], ready_event: object
     ) -> None:
         try:
+            t0 = time.perf_counter()
             ready_event.synchronize()
+            ready_ms = (time.perf_counter() - t0) * 1e3
+            grp_ms: list[float] = []
+            nbytes: dict[str, int] = defaultdict(int)
             by_layer: dict[int, list[_PoolRangePlan]] = defaultdict(list)
             for plan in plans:
                 for logical_layer in self.pool_layers[plan.name]:
                     by_layer[logical_layer].append(plan)
 
             for group in self._layer_groups():
+                t_group = time.perf_counter()
                 for plan in self._plans_covering(by_layer, group):
                     meta = self._layer_group_ranges(plan, group)
                     if meta is None:
                         continue
                     ptrs, sizes, offsets = meta
                     step = self._entries_per_call(sizes)
+                    if LW_STATS:
+                        nbytes[plan.name.name] += sum(sum(s) for s in sizes)
                     for start in range(0, len(plan.keys), step):
                         end = start + step
                         chunk_keys = plan.keys[start:end]
@@ -881,6 +954,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                                 f"success={sum(bool(value) for value in results)}/"
                                 f"{len(chunk_keys)}."
                             )
+                grp_ms.append(round((time.perf_counter() - t_group) * 1e3, 1))
+                if LW_STATS and group[-1] == self.num_layers - 1:
+                    # Before the last completion, so the report can see it.
+                    self.layer_done_counter.load_info.setdefault(
+                        counter_index, {}
+                    ).update(ready_ms=ready_ms, grp_ms=grp_ms, bytes=dict(nbytes))
                 # Only now is every layer in the group readable, so they are
                 # released together. A group wider than 1 trades overlap
                 # granularity for fewer times each object is named on the wire.
