@@ -157,7 +157,7 @@ class LayerWiseLoadCounter:
             logger.info(
                 "UMBPLW idx=%d stall_gpu_ms=%.1f stall_cpu_ms=%.1f blocked=%d "
                 "first_blocked=%s worst=%s ready_ms=%.1f grp_ms=%s reqs=%s "
-                "keys=%s bytes=%s",
+                "keys=%s bytes=%s grp2_ms=%s bytes2=%s",
                 index,
                 sum(gpu),
                 sum(cpu for *_, cpu in blocked),
@@ -169,6 +169,8 @@ class LayerWiseLoadCounter:
                 info.get("reqs", {}),
                 info.get("keys", {}),
                 info.get("bytes", {}),
+                info.get("grp2_ms", []),
+                info.get("bytes2", {}),
             )
 
     def reset(self) -> None:
