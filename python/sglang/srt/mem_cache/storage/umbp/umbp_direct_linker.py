@@ -46,6 +46,30 @@ CHUNK_PAGES = 64
 # Log per-load-batch GPU stalls and group timings (measurement only).
 LW_STATS = os.getenv("UMBP_LW_STATS", "0") == "1"
 
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _stage_copy_kernel(desc, src_rows, dst_rows, ELEM: tl.constexpr, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+        # Program (block, page): desc row = src, dst addresses, size, stride, pages, first row.
+        d = desc + tl.program_id(0) * 6
+        k = tl.program_id(1)
+        if k < tl.load(d + 4):
+            size = tl.load(d + 2)
+            i = tl.load(d + 5) + k
+            src = (tl.load(d) + tl.load(src_rows + i) * size).to(tl.pointer_type(ELEM))
+            dst = (tl.load(d + 1) + tl.load(dst_rows + i) * tl.load(d + 3)).to(tl.pointer_type(ELEM))
+            n = (size // WIDTH).to(tl.int32)
+            for start in range(0, n, BLOCK):
+                o = start + tl.arange(0, BLOCK)
+                m = o < n
+                tl.store(dst + o, tl.load(src + o, mask=m), mask=m)
+
+    _STAGE_ELEMS = {8: tl.int64, 4: tl.int32, 2: tl.int16, 1: tl.uint8}
+except ImportError:
+    triton = None
+
 # Budget by ranges because pool layouts attach different counts per object;
 # 8192 stays below gRPC's default message limit.
 RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
@@ -579,6 +603,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             if not self.storage2.client.register_memory(*allocation):
                 raise RuntimeError(f"Failed to register a GPU KV buffer with {address}.")
         self._split_executor = ThreadPoolExecutor(1, thread_name_prefix=f"umbp-load2-tp{tp_rank}")
+        self._exists_executor = ThreadPoolExecutor(2, thread_name_prefix=f"umbp-exists-tp{tp_rank}")
         self._page_threshold = int(fraction * 1000)
         self.split_layer = None
         if self.split_mode == "layer":
@@ -673,7 +698,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._stage_lease = float(os.getenv("UMBP_STAGE_LEASE_S", "600"))
         self._stage_stats: dict[str, int] = defaultdict(int)
         self._stage_stream = None
-        self._stage_dst: dict[tuple, torch.Tensor] = {}
         self._stage_next_expire = self._stage_next_log = time.monotonic()
         self._stage_exec = ThreadPoolExecutor(1, thread_name_prefix=f"umbp-stage-tp{tp_rank}")
         layer = self.split_mode == "layer"
@@ -1016,56 +1040,57 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 if run.doomed and run.ready and not run.busy:
                     self._free_run_locked(run)
 
-    def _copy_staged_group(self, staged, group: list[int], scratch) -> int:
-        """Enqueue one group's staged pages: scratch-sized copies, then a scatter per block."""
-        nbytes = 0
-        for run, pools in staged:
-            for name, src, rows in pools:
+    def _copy_staged_group(self, staged, group: list[int], scratch, rows) -> int:
+        """Enqueue one group's staged pages: a copy per run, then a scatter per scratch fill."""
+        nbytes, used, desc = 0, 0, []
+        for run, spans in staged:
+            blocks = []
+            for name, first, n in spans:
                 entry = self.pools[name]
-                pages = run.pages[name]
-                # A pool's blocks within a group are adjacent in the run.
-                blocks = [
-                    (b, c, *run.blocks[(name, layer, c)])
-                    for layer in group
-                    if (b := entry.layer_mapping.get(layer)) is not None
-                    for c in range(len(entry.buffer_meta))
-                ]
-                i = 0
-                while i < len(blocks):
-                    first, j = blocks[i][2], i + 1
-                    while j < len(blocks) and blocks[j][2] + pages * blocks[j][3] - first <= scratch.numel():
-                        j += 1
-                    last = blocks[j - 1][2] + pages * blocks[j - 1][3]
-                    buf = scratch[: last - first]
-                    buf.copy_(
-                        self._stage_arena[run.offset + first : run.offset + last], non_blocking=True
-                    )
-                    nbytes += last - first
-                    for b, c, pos, size in blocks[i:j]:
-                        block = buf[pos - first : pos - first + pages * size].view(pages, size)
-                        self._scatter(entry, c, b, block.index_select(0, src), rows)
-                    i = j
+                for layer in group:
+                    b = entry.layer_mapping.get(layer)
+                    if b is None:
+                        continue
+                    for c, meta in enumerate(entry.buffer_meta):
+                        pos, size = run.blocks[(name, layer, c)]
+                        blocks.append((pos, run.pages[name] * size, size, *meta[b][:2], n, first))
+            if not blocks:
+                continue
+            # A run's group is contiguous (group-major layout).
+            lo = min(pos for pos, *_ in blocks)
+            hi = max(pos + extent for pos, extent, *_ in blocks)
+            if used + hi - lo > scratch.numel():
+                self._stage_scatter(scratch, desc, rows)
+                used, desc = 0, []
+            scratch[used : used + hi - lo].copy_(
+                self._stage_arena[run.offset + lo : run.offset + hi], non_blocking=True
+            )
+            base = scratch.data_ptr() + used - lo
+            desc += [
+                (base + pos, ptr, size, stride, n, first)
+                for pos, _, size, ptr, stride, n, first in blocks
+            ]
+            used += hi - lo
+            nbytes += hi - lo
+        if desc:
+            self._stage_scatter(scratch, desc, rows)
         return nbytes
 
-    def _scatter(self, entry, c: int, b: int, data: torch.Tensor, rows: torch.Tensor) -> None:
-        """Write page rows the way a direct get would: size bytes at row * stride."""
-        ptr, stride, _ = entry.buffer_meta[c][b]
-        size = data.shape[1]
-        unit = math.gcd(stride, size)
-        dst = self._stage_dst.get((ptr, unit))
-        if dst is None:
-            tensor = entry.components[c][b]
-            offset = tensor.storage_offset() * tensor.element_size()
-            nbytes = tensor.untyped_storage().nbytes() - offset
-            flat = torch.empty(0, dtype=torch.uint8, device=tensor.device)
-            flat.set_(tensor.untyped_storage(), offset, (nbytes // unit * unit,))
-            if flat.data_ptr() != ptr:
-                raise RuntimeError(f"UMBP stage scatter: buffer at 0x{flat.data_ptr():x}, meta 0x{ptr:x}.")
-            dst = self._stage_dst[(ptr, unit)] = flat.view(-1, unit)
-        index = rows * (stride // unit)
-        if size > unit:
-            index = (index[:, None] + torch.arange(size // unit, device=rows.device)).reshape(-1)
-        dst[index] = data.reshape(-1, unit)
+    def _stage_scatter(self, scratch, desc, rows) -> None:
+        """Each (block, page): size bytes from the scratch to row * stride of its buffer (addresses)."""
+        if scratch.device.type == "cpu":
+            # Tests: the kernel's copies, by memmove.
+            src_rows, dst_rows = (r.tolist() for r in rows)
+            for src, dst, size, stride, n, first in desc:
+                for k in range(first, first + n):
+                    ctypes.memmove(dst + dst_rows[k] * stride, src + src_rows[k] * size, size)
+            return
+        table = torch.tensor(desc, dtype=torch.int64).pin_memory()
+        table = table.to(scratch.device, non_blocking=True)
+        grid = (len(desc), max(n for *_, n, _ in desc))
+        # The widest element every address, size and stride is a multiple of.
+        align = math.gcd(8, *(v for row in desc for v in row[:4]))
+        _stage_copy_kernel[grid](table, *rows, ELEM=_STAGE_ELEMS[align], WIDTH=align, BLOCK=1024)
 
     def _register_buffers(self) -> None:
         seen = set()
@@ -1112,14 +1137,19 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 for storage, suffix, part in ((self.storage, "", "front"), (self.storage2, "|b", "back"))
                 if self._part_layers(transfer.name, part)
             ]
-            results = [self._exists_on(s, page_keys, transfer, suffix) for s, suffix in parts]
-            return [all(values) for values in zip(*results)]
+            # Both servers at once: lookups block the lockstep DP ranks.
+            results = [
+                self._exists_executor.submit(self._exists_on, s, page_keys, transfer, suffix)
+                for s, suffix in parts
+            ]
+            return [all(values) for values in zip(*(r.result() for r in results))]
         if self.split_mode == "page":
             routes = self._page_routes(page_keys)
-            found = {}
+            asks = []
             for storage, routed in ((self.storage, False), (self.storage2, True)):
                 keys = [k for k, r in zip(page_keys, routes) if r == routed]
-                found.update(zip(keys, self._exists_on(storage, keys, transfer)))
+                asks.append((keys, self._exists_executor.submit(self._exists_on, storage, keys, transfer)))
+            found = {k: v for keys, ask in asks for k, v in zip(keys, ask.result())}
             return [found[k] for k in page_keys]
         return self._exists_on(self.storage, page_keys, transfer)
 
@@ -1661,25 +1691,26 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         yield
 
             with copy_ctx():
-                staged = [
-                    (run, [
-                        (name, torch.tensor(src, device=device), torch.tensor(dst, device=device))
-                        for name, src, dst in pools
-                    ])
-                    for run, pools in staged
-                ]
-                block = max(
-                    run.pages[name] * size
-                    for run, _ in staged
-                    for (name, _, _), (_, size) in run.blocks.items()
+                src_rows, dst_rows, spans = [], [], []
+                for run, pools in staged:
+                    spans.append((run, [(name, len(src_rows), len(src)) for name, src, _ in pools]))
+                    for _, src, dst in pools:
+                        src_rows += src
+                        dst_rows += dst
+                rows = tuple(
+                    torch.tensor(r, dtype=torch.int64).pin_memory().to(device, non_blocking=True)
+                    if device.type != "cpu" else torch.tensor(r, dtype=torch.int64)
+                    for r in (src_rows, dst_rows)
                 )
-                scratch = torch.empty(max(block, STAGE_SCRATCH), dtype=torch.uint8, device=device)
+                staged = spans
+                size = max(STAGE_SCRATCH, max(run.size for run, _ in staged))
+                scratch = torch.empty(size, dtype=torch.uint8, device=device)
 
         for group in groups:
             t_group = time.perf_counter()
             if staged:
                 with copy_ctx():
-                    copied = self._copy_staged_group(staged, group, scratch)
+                    copied = self._copy_staged_group(staged, group, scratch, rows)
                 if LW_STATS:
                     nbytes["STAGED"] += copied
             for plan in self._plans_covering(by_layer, group):
@@ -1926,6 +1957,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             logger.info("UMBPSTAGE final %s", dict(self._stage_stats))
         if self.storage2 is not None:
             self._split_executor.shutdown(wait=True)
+            self._exists_executor.shutdown(wait=True)
             if self._standalone_process_mode and self._registered:
                 self.storage2.client.deregister_memory(self._registered[0][0])
             self.storage2.close()
