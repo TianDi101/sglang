@@ -801,7 +801,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                     i += 1
                     continue
                 chunk = range(i, min(end, i + CHUNK_PAGES * 4))
-                for j, present in zip(chunk, self._page_exists([hashes[j] for j in chunk], transfer)):
+                for j, present in zip(chunk, self._page_exists([hashes[j] for j in chunk], transfer, rid)):
                     have[j] = present
                     if not present:
                         end = j
@@ -1142,7 +1142,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         # every layer, and a layer is read back as a byte range inside it.
         return component_keys, multiplier
 
-    def _page_exists(self, page_keys: list[str], transfer: PoolTransfer) -> list[bool]:
+    def _page_exists(self, page_keys: list[str], transfer: PoolTransfer, rid: str | None = None) -> list[bool]:
         if self.split_mode == "layer":
             # A page is a hit only when every part it was written as survives.
             parts = [
@@ -1152,7 +1152,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             ]
             # Both servers at once: lookups block the lockstep DP ranks.
             results = [
-                self._exists_executor.submit(self._exists_on, s, page_keys, transfer, suffix)
+                self._exists_executor.submit(self._exists_unstaged, s, page_keys, transfer, suffix, rid)
+                if s is self.storage2
+                else self._exists_executor.submit(self._exists_on, s, page_keys, transfer, suffix)
                 for s, suffix in parts
             ]
             return [all(values) for values in zip(*(r.result() for r in results))]
@@ -1161,10 +1163,33 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             asks = []
             for storage, routed in ((self.storage, False), (self.storage2, True)):
                 keys = [k for k, r in zip(page_keys, routes) if r == routed]
-                asks.append((keys, self._exists_executor.submit(self._exists_on, storage, keys, transfer)))
+                ask = (
+                    self._exists_executor.submit(self._exists_unstaged, storage, keys, transfer, "", rid)
+                    if routed
+                    else self._exists_executor.submit(self._exists_on, storage, keys, transfer)
+                )
+                asks.append((keys, ask))
             found = {k: v for keys, ask in asks for k, v in zip(keys, ask.result())}
             return [found[k] for k in page_keys]
         return self._exists_on(self.storage, page_keys, transfer)
+
+    def _exists_unstaged(
+        self, storage, page_keys: list[str], transfer: PoolTransfer, suffix: str, rid: str | None
+    ) -> list[bool]:
+        """Second server: pages this request already staged are present; ask only for the rest."""
+        if self._stage_arena is None or rid is None or not page_keys:
+            return self._exists_on(storage, page_keys, transfer, suffix)
+        keys, n = self._object_keys_for_pages(page_keys, transfer)
+        with self._stage_cv:
+            # Own runs only: they live until this request's load, another's may be freed first.
+            staged = [
+                (hit := self._staged.get((transfer.name, keys[i * n]))) is not None
+                and hit[0].ready and hit[0].rid == rid
+                for i in range(len(page_keys))
+            ]
+        ask = [key for key, done in zip(page_keys, staged) if not done]
+        found = iter(self._exists_on(storage, ask, transfer, suffix) if ask else ())
+        return [done or next(found) for done in staged]
 
     def _exists_on(
         self, storage, page_keys: list[str], transfer: PoolTransfer, suffix: str = ""
@@ -1245,7 +1270,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # cannot change the answer. This runs synchronously inside the
             # scheduler's prefill batch build, and DP-attention ranks are
             # lockstep, so every extra key is stall charged to all of them.
-            page_exists = self._page_exists(page_keys[: valid_pages[-1]], transfer)
+            page_exists = self._page_exists(page_keys[: valid_pages[-1]], transfer, rid)
             valid_pages = self._apply_hit_policy(valid_pages, page_exists, transfer)
             if not valid_pages:
                 break
