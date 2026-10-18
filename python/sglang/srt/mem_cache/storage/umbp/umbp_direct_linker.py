@@ -80,6 +80,7 @@ class _StageRun:
     ready: bool = False
     busy: int = 0
     doomed: bool = False
+    used: int = 0
 
 
 def _install_stage_hook() -> None:
@@ -651,8 +652,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         # (pool, first object key of a page) -> (run, page index in the run)
         self._staged: dict[tuple[PoolName, str], tuple[_StageRun, int]] = {}
         self._stage_seen: dict[str, float] = {}
-        # rid -> {pool: (page count per object, second-server object keys)}
-        self._stage_objs: dict[str, dict] = {}
+        # rid -> (page hashes, page routes, {pool: [transfer, objects per page, keys, page known present]})
+        self._stage_objs: dict[str, tuple] = {}
         self._stage_waiting: set[str] = set()
         self._stage_loading: set[str] = set()
         self._stage_gone: dict[str, float] = {}
@@ -690,12 +691,13 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             from sglang.srt.mem_cache.radix_cache import RadixKey
 
             self._stage_seen[rid] = now
-            # HBM residency is ignored: a queued prefix is mostly evicted by admission.
             key = RadixKey(req.origin_input_ids, extra_key=req.extra_key, cache_salt=req.cache_salt)
+            # Read-only and re-read every recheck: HBM pages are staged once evicted.
+            device_len = cache.tree_core.match_full_device_prefix(key)[0]
             key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
             with self._stage_cv:
                 self._stage_waiting.add(rid)
-            self._stage_exec.submit(self._stage_request, rid, key)
+            self._stage_exec.submit(self._stage_request, rid, key, device_len)
         if self._stage_runs or self._stage_waiting:
             queued = {req.rid for req in waiting_queue}
             with self._stage_cv:
@@ -716,9 +718,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 used = self._stage_arena.numel() - sum(size for _, size in self._stage_free)
             logger.info("UMBPSTAGE used_mb=%d %s", used >> 20, dict(self._stage_stats))
 
-    def _stage_request(self, rid: str, key) -> None:
+    def _stage_request(self, rid: str, key, device_len: int) -> None:
         try:
-            self._stage_one(rid, key)
+            self._stage_one(rid, key, device_len)
         except Exception:
             self._stage_stats["errors"] += 1
             logger.exception("UMBP stage of rid=%s failed", rid)
@@ -732,45 +734,53 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         n = len(key) // self.page_size * self.page_size
         return get_storage_hash_str(key[:n], None, page_size=self.page_size) if n else []
 
-    def _stage_objects(self, key) -> dict[PoolName, tuple[int, list[str]]]:
-        """Second-server object keys per pool for every page of the prompt."""
+    def _stage_objects(self, key):
         hashes = self._stage_hashes(key)
         transfers = self.pool_group.resolve_transfers(
             [PoolTransfer(name=PoolName.KV, keys=hashes)], allow_partial=True
         )
-        objects = {}
+        routes = self._page_routes(hashes) if self.split_mode == "page" else None
+        pools = {}
         for transfer in transfers:
-            if self.split_mode == "layer":
-                if not self._part_layers(transfer.name, "back"):
-                    continue
-                pages = hashes
-            else:
-                pages = [k for k, r in zip(hashes, self._page_routes(hashes)) if r]
-            if pages:
-                keys, n = self._object_keys_for_pages(pages, transfer)
-                objects[transfer.name] = (n, keys)
-        return objects
+            keys, n = self._object_keys_for_pages(hashes, transfer)
+            pools[transfer.name] = [transfer, n, keys, [False] * len(hashes)]
+        return hashes, routes, pools
 
-    def _stage_one(self, rid: str, key) -> None:
+    def _stage_one(self, rid: str, key, device_len: int) -> None:
         if rid in self._stage_gone:
             self._stage_stats["late"] += 1
             return
-        objects = self._stage_objs.get(rid)
-        if objects is None:
-            objects = self._stage_objs[rid] = self._stage_objects(key)
+        state = self._stage_objs.get(rid)
+        if state is None:
+            state = self._stage_objs[rid] = self._stage_objects(key)
+        hashes, routes, pools = state
+        # A load restores [HBM prefix, first page missing on either server).
+        first, end = device_len // self.page_size, len(hashes)
+        for transfer, _, _, have in pools.values():
+            i = first
+            while i < end:
+                if have[i]:
+                    i += 1
+                    continue
+                chunk = range(i, min(end, i + CHUNK_PAGES * 4))
+                for j, present in zip(chunk, self._page_exists([hashes[j] for j in chunk], transfer)):
+                    have[j] = present
+                    if not present:
+                        end = j
+                        break
+                i = chunk[-1] + 1
         todo = {}
-        for name, (n, keys) in objects.items():
+        for name, (_, n, keys, _) in pools.items():
+            if self.split_mode == "layer" and not self._part_layers(name, "back"):
+                continue
             with self._stage_cv:
                 # A page another queued request staged is shared, not read twice.
-                fresh = [i for i in range(len(keys) // n) if (name, keys[i * n]) not in self._staged]
-            names = [keys[i * n + j] + self._stage_suffix for i in fresh for j in range(n)]
-            step = CHUNK_PAGES * self.num_layers
-            found = []
-            for start in range(0, len(names), step):
-                found.extend(self.storage2.client.batch_exists(names[start : start + step]))
-            ready = [i for k, i in enumerate(fresh) if all(found[k * n : (k + 1) * n])]
-            if ready:
-                todo[name] = (n, [keys[i * n + j] for i in ready for j in range(n)])
+                fresh = [
+                    i for i in range(first, end)
+                    if (routes is None or routes[i]) and (name, keys[i * n]) not in self._staged
+                ]
+            if fresh:
+                todo[name] = (n, [keys[i * n + j] for i in fresh for j in range(n)])
         if not todo:
             self._stage_stats["nothing"] += 1
             return
@@ -908,6 +918,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     def _free_run_locked(self, run: _StageRun) -> None:
         if run.offset < 0:
             return
+        self._stage_stats["pages_unused"] += max(0, len(run.keys) - run.used)
         for page_key in run.keys:
             if self._staged.get(page_key, (None,))[0] is run:
                 del self._staged[page_key]
@@ -958,6 +969,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         keep.append(i)
                         continue
                     _, src, dst = by_run.setdefault(id(hit[0]), (hit[0], [], []))
+                    hit[0].used += 1
                     src.append(hit[1])
                     dst.append(row)
                 for run, src, dst in by_run.values():
