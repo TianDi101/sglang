@@ -1592,8 +1592,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             ready_event.synchronize()
             ready_ms = (time.perf_counter() - t0) * 1e3
             streams = self._load_streams(plans)
-            if self._stage_arena is not None:
-                streams[1], staged = self._take_staged(streams[1], rids)
             stats = [([], defaultdict(int)) for _ in streams]
             # A group is released once every stream that covers it is done.
             pending: dict[int, int] = defaultdict(int)
@@ -1619,11 +1617,15 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 for logical_layer in group:
                     self.layer_done_counter.complete(counter_index, logical_layer)
 
-            second = None
-            if len(streams) > 1:
-                second = self._split_executor.submit(
-                    self._run_stream, streams[1], stats[1], finish, staged
-                )
+            def run_second() -> None:
+                stream = streams[1]
+                if self._stage_arena is not None:
+                    # Here, not before the first stream: waiting on staging must not hold back layer 0.
+                    stream, taken = self._take_staged(stream, rids)
+                    staged.extend(taken)
+                self._run_stream(stream, stats[1], finish, staged)
+
+            second = self._split_executor.submit(run_second) if len(streams) > 1 else None
             try:
                 self._run_stream(streams[0], stats[0], finish)
             finally:
