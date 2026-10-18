@@ -54,6 +54,8 @@ RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
 STAGE_WAIT_S = float(os.getenv("UMBP_STAGE_WAIT_S", "5"))
 # A queued request is re-checked this often: its prefix keeps leaving HBM and landing on SSD.
 STAGE_RECHECK_S = float(os.getenv("UMBP_STAGE_RECHECK_S", "2"))
+# Arena run size cap; a request stages as several runs.
+STAGE_CHUNK = int(os.getenv("UMBP_STAGE_CHUNK_MB", "64")) << 20
 # Device scratch for staged host-to-device copies; a larger block gets its own.
 STAGE_SCRATCH = int(os.getenv("UMBP_STAGE_SCRATCH_MB", "64")) << 20
 _ARENA_ALIGN = 4096
@@ -667,6 +669,16 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             self._layer_groups(self.split_layer, self.num_layers) if layer else self._layer_groups()
         )
         self._stage_part, self._stage_suffix = ("back", "|b") if layer else (None, "")
+        self._stage_page_bytes = {
+            name: sum(
+                component[entry.layer_mapping[l]][2]
+                for group in self._stage_groups
+                for l in group
+                if l in entry.layer_mapping
+                for component in entry.buffer_meta
+            )
+            for name, entry in self.pools.items()
+        }
 
     def stage_ahead(self, waiting_queue, cache) -> None:
         """Scheduler thread: hand queued requests to the stage thread, again every recheck."""
@@ -762,11 +774,24 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         if not todo:
             self._stage_stats["nothing"] += 1
             return
+        # Bounded chunks, prefix first: a full or fragmented arena still takes the head.
+        per = max(1, STAGE_CHUNK // sum(self._stage_page_bytes[name] for name in todo))
+        most = max(len(keys) // n for n, keys in todo.values())
+        for start in range(0, most, per):
+            chunk = {
+                name: (n, keys[start * n : (start + per) * n])
+                for name, (n, keys) in todo.items()
+                if len(keys) > start * n
+            }
+            if not self._stage_run(rid, chunk):
+                return
+
+    def _stage_run(self, rid: str, todo: dict[PoolName, tuple[int, list[str]]]) -> bool:
         counts = {name: len(keys) // n for name, (n, keys) in todo.items()}
         blocks, size = self._stage_layout(counts)
         reserved = self._stage_reserve(rid, size)
         if reserved is None:
-            return
+            return False
         t0 = time.monotonic()
         run = _StageRun(rid, *reserved, t0, threading.Event(), counts, blocks, [])
         with self._stage_cv:
@@ -793,11 +818,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 run.ready = True
                 run.done.set()
                 self._stage_stats["runs"] += 1
-                self._stage_stats["bytes_mb"] += size >> 20
+                self._stage_stats["bytes_mb"] += -(-size >> 20)
                 self._stage_stats["failed_pages"] += len(failed)
                 self._stage_stats["stage_ms"] += int((time.monotonic() - t0) * 1e3)
                 if run.doomed and not run.busy:
                     self._free_run_locked(run)
+        return True
 
     def _stage_layout(self, counts: dict[PoolName, int]):
         blocks, pos = {}, 0
