@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import copy
+import ctypes
 import logging
+import math
 import os
 import threading
 import time
@@ -46,6 +49,56 @@ LW_STATS = os.getenv("UMBP_LW_STATS", "0") == "1"
 # Budget by ranges because pool layouts attach different counts per object;
 # 8192 stays below gRPC's default message limit.
 RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
+
+# Stage-ahead: a load waits this long for its request's in-flight staging.
+STAGE_WAIT_S = float(os.getenv("UMBP_STAGE_WAIT_S", "5"))
+# A request waits this long for arena space before it is left to direct reads.
+STAGE_SPACE_WAIT_S = float(os.getenv("UMBP_STAGE_SPACE_WAIT_S", "30"))
+# Device scratch for staged host-to-device copies; a larger block gets its own.
+STAGE_SCRATCH = int(os.getenv("UMBP_STAGE_SCRATCH_MB", "64")) << 20
+_ARENA_ALIGN = 4096
+
+
+@dataclass
+class _StageRun:
+    """One request's staged second-server objects in one arena run.
+
+    Every (pool, layer, component) is a page-major block, ordered group, pool, layer,
+    so a load copies a pool's blocks for one layer group as one contiguous range.
+    """
+
+    rid: str
+    offset: int
+    size: int
+    t0: float
+    done: threading.Event
+    pages: dict[PoolName, int]
+    blocks: dict[tuple[PoolName, int, int], tuple[int, int]]
+    keys: list[tuple[PoolName, str]]
+    ready: bool = False
+    busy: int = 0
+    doomed: bool = False
+
+
+def _install_stage_hook() -> None:
+    """Hand queued requests to the linker at every prefill build, before admission."""
+    from sglang.srt.managers.scheduler import Scheduler
+
+    if getattr(Scheduler, "_umbp_stage_hook", False):
+        return
+    build = Scheduler.get_new_batch_prefill
+
+    def get_new_batch_prefill(self, *args, **kwargs):
+        linker = getattr(getattr(self.tree_cache, "linker", None), "cache_linker", None)
+        if getattr(linker, "_stage_arena", None) is not None and self.waiting_queue:
+            try:
+                linker.stage_ahead(self.waiting_queue, self.tree_cache)
+            except Exception:
+                logger.exception("UMBP stage-ahead failed")
+        return build(self, *args, **kwargs)
+
+    Scheduler.get_new_batch_prefill = get_new_batch_prefill
+    Scheduler._umbp_stage_hook = True
 
 
 def _storage_suffix(
@@ -452,9 +505,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         # back layers ("layer") or a hashed fraction of the pages ("page").
         self.split_mode = os.getenv("UMBP_SPLIT_MODE", "")
         self.storage2 = None
+        self._stage_arena = None
         if self.split_mode:
             try:
                 self._init_split(storage_config, tp_rank)
+                if int(os.getenv("UMBP_STAGE_ARENA_MB", "0")) > 0:
+                    self._init_stage(tp_rank)
             except BaseException:
                 self.storage.close()
                 raise
@@ -555,6 +611,408 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     def _part_layers(self, name: PoolName, part: str) -> list[int]:
         layers = self.pool_layers[name]
         return [l for l in layers if (l < self.split_layer) == (part == "front")]
+
+    # ---- stage-ahead: queued requests' second-server objects into a host arena ----
+
+    def _init_stage(self, tp_rank: int) -> None:
+        import mori.umbp as umbp_mod
+
+        size = int(os.environ["UMBP_STAGE_ARENA_MB"]) << 20
+        self._stage_alloc = umbp_mod.UMBPHostMemAllocator()
+        handle = self._stage_alloc.alloc(
+            size, umbp_mod.UMBPHostBufferBacking.AnonymousShm, 2 << 20, -1, True
+        )
+        if not handle:
+            raise RuntimeError(f"UMBP stage arena alloc of {size} bytes failed.")
+        self._stage_handle = handle
+        ptr = int(handle.ptr)
+        if not self.storage2.client.register_memory(ptr, size):
+            raise RuntimeError("Failed to register the stage arena with the second server.")
+        # Unpinned still works, only the per-group copies stop being async.
+        self._stage_pinned = int(torch.cuda.cudart().cudaHostRegister(ptr, size, 0)) == 0
+        arena = torch.frombuffer(
+            (ctypes.c_byte * size).from_address(ptr), dtype=torch.uint8, count=size
+        )
+        self._init_stage_state(arena, tp_rank)
+        _install_stage_hook()
+        logger.info(
+            "UMBP stage arena %d MiB pinned=%s depth=%d",
+            size >> 20, self._stage_pinned, self._stage_depth,
+        )
+
+    def _init_stage_state(self, arena: torch.Tensor, tp_rank: int) -> None:
+        self._stage_arena = arena
+        self._stage_ptr = arena.data_ptr()
+        self._stage_cv = threading.Condition()
+        self._stage_free = [(0, arena.numel())]
+        self._stage_runs: dict[str, _StageRun] = {}
+        # (pool, first object key of a page) -> (run, page index in the run)
+        self._staged: dict[tuple[PoolName, str], tuple[_StageRun, int]] = {}
+        self._stage_seen: dict[str, float] = {}
+        self._stage_waiting: set[str] = set()
+        self._stage_loading: set[str] = set()
+        self._stage_gone: dict[str, float] = {}
+        self._stage_depth = int(os.getenv("UMBP_STAGE_DEPTH", "64"))
+        self._stage_lease = float(os.getenv("UMBP_STAGE_LEASE_S", "600"))
+        self._stage_stats: dict[str, int] = defaultdict(int)
+        self._stage_stream = None
+        self._stage_dst: dict[tuple, torch.Tensor] = {}
+        self._stage_next_expire = self._stage_next_log = time.monotonic()
+        self._stage_exec = ThreadPoolExecutor(1, thread_name_prefix=f"umbp-stage-tp{tp_rank}")
+        layer = self.split_mode == "layer"
+        # Group-major like the second load stream, so a group's copy is contiguous.
+        self._stage_groups = (
+            self._layer_groups(self.split_layer, self.num_layers) if layer else self._layer_groups()
+        )
+        self._stage_part, self._stage_suffix = ("back", "|b") if layer else (None, "")
+
+    def stage_ahead(self, waiting_queue, cache) -> None:
+        """Scheduler thread: hand each queued request to the stage thread once."""
+        now = time.monotonic()
+        tree = cache.tree_core
+        for req in waiting_queue[: self._stage_depth]:
+            if req.rid in self._stage_seen:
+                continue
+            from sglang.srt.mem_cache.radix_cache import RadixKey
+
+            self._stage_seen[req.rid] = now
+            key = RadixKey(req.origin_input_ids, extra_key=req.extra_key, cache_salt=req.cache_salt)
+            # Read-only; pages already in HBM are not worth SSD bandwidth.
+            device_len = tree.match_full_device_prefix(key)[0]
+            key, _ = key.maybe_to_bigram_view(tree.is_eagle)
+            with self._stage_cv:
+                self._stage_waiting.add(req.rid)
+            self._stage_exec.submit(self._stage_request, req.rid, key, device_len)
+        if self._stage_runs or self._stage_waiting:
+            queued = {req.rid for req in waiting_queue}
+            with self._stage_cv:
+                # Admitted without a load, or aborted: nothing will consume the run.
+                for rid in [*self._stage_runs, *self._stage_waiting]:
+                    if rid not in queued and rid not in self._stage_loading:
+                        self._stage_gone[rid] = now
+                        self._stage_waiting.discard(rid)
+                        if rid in self._stage_runs:
+                            self._doom_locked(self._stage_runs[rid])
+        if now >= self._stage_next_expire:
+            self._stage_next_expire = now + 5
+            self._expire_stage(now)
+        if now >= self._stage_next_log:
+            self._stage_next_log = now + 60
+            with self._stage_cv:
+                used = self._stage_arena.numel() - sum(size for _, size in self._stage_free)
+            logger.info("UMBPSTAGE used_mb=%d %s", used >> 20, dict(self._stage_stats))
+
+    def _stage_request(self, rid: str, key, device_len: int) -> None:
+        try:
+            self._stage_one(rid, key, device_len)
+        except Exception:
+            self._stage_stats["errors"] += 1
+            logger.exception("UMBP stage of rid=%s failed", rid)
+        finally:
+            with self._stage_cv:
+                self._stage_waiting.discard(rid)
+
+    def _stage_hashes(self, key) -> list[str]:
+        from sglang.srt.mem_cache.utils import get_storage_hash_str
+
+        n = len(key) // self.page_size * self.page_size
+        return get_storage_hash_str(key[:n], None, page_size=self.page_size) if n else []
+
+    def _stage_pages(self, hashes: list[str]) -> dict[PoolName, tuple[int, list[str]]]:
+        """Second-server object keys per pool, for the pages a load could restore."""
+        transfers = self.pool_group.resolve_transfers(
+            [PoolTransfer(name=PoolName.KV, keys=hashes)], allow_partial=True
+        )
+        # Loads stop at the first page missing on either server.
+        end = len(hashes)
+        for transfer in transfers:
+            exists = self._page_exists(hashes[:end], transfer)
+            end = next((i for i, e in enumerate(exists) if not e), end)
+        chosen = {}
+        for transfer in transfers:
+            if self.split_mode == "layer":
+                if not self._part_layers(transfer.name, "back"):
+                    continue
+                pages = hashes[:end]
+            else:
+                pages = [k for k, r in zip(hashes[:end], self._page_routes(hashes[:end])) if r]
+            if pages:
+                keys, n = self._object_keys_for_pages(pages, transfer)
+                chosen[transfer.name] = (n, keys)
+        return chosen
+
+    def _stage_one(self, rid: str, key, device_len: int) -> None:
+        if rid in self._stage_gone:
+            self._stage_stats["late"] += 1
+            return
+        hashes = self._stage_hashes(key)[device_len // self.page_size :]
+        chosen = self._stage_pages(hashes)
+        todo = {}
+        with self._stage_cv:
+            # A page another queued request staged is shared, not read twice.
+            for name, (n, keys) in chosen.items():
+                fresh = [i for i in range(len(keys) // n) if (name, keys[i * n]) not in self._staged]
+                if fresh:
+                    todo[name] = (n, [keys[i * n + j] for i in fresh for j in range(n)])
+        if not todo:
+            self._stage_stats["nothing"] += 1
+            return
+        counts = {name: len(keys) // n for name, (n, keys) in todo.items()}
+        blocks, size = self._stage_layout(counts)
+        reserved = self._stage_reserve(rid, size)
+        if reserved is None:
+            return
+        t0 = time.monotonic()
+        run = _StageRun(rid, *reserved, t0, threading.Event(), counts, blocks, [])
+        with self._stage_cv:
+            for name, (n, keys) in todo.items():
+                for i in range(counts[name]):
+                    page_key = (name, keys[i * n])
+                    if page_key not in self._staged:
+                        self._staged[page_key] = (run, i)
+                        run.keys.append(page_key)
+            self._stage_runs[rid] = run
+        failed = []
+        try:
+            for name, (n, keys) in todo.items():
+                ok = self._stage_get(name, n, keys, run)
+                failed.extend((name, keys[i * n]) for i, good in enumerate(ok) if not good)
+        except BaseException:
+            failed = list(run.keys)
+            raise
+        finally:
+            with self._stage_cv:
+                for page_key in failed:
+                    if self._staged.get(page_key, (None,))[0] is run:
+                        del self._staged[page_key]
+                run.ready = True
+                run.done.set()
+                self._stage_stats["requests"] += 1
+                self._stage_stats["bytes_mb"] += size >> 20
+                self._stage_stats["failed_pages"] += len(failed)
+                self._stage_stats["stage_ms"] += int((time.monotonic() - t0) * 1e3)
+                if run.doomed and not run.busy:
+                    self._free_run_locked(run)
+
+    def _stage_layout(self, counts: dict[PoolName, int]):
+        blocks, pos = {}, 0
+        for group in self._stage_groups:
+            for name, pages in counts.items():
+                entry = self.pools[name]
+                for layer in group:
+                    b = entry.layer_mapping.get(layer)
+                    if b is None:
+                        continue
+                    for c, component in enumerate(entry.buffer_meta):
+                        blocks[(name, layer, c)] = (pos, component[b][2])
+                        pos += pages * component[b][2]
+        return blocks, pos
+
+    def _stage_get(self, name: PoolName, n: int, keys: list[str], run: _StageRun) -> list[bool]:
+        """Read one pool's staged objects into the run's blocks; per-page success."""
+        entry = self.pools[name]
+        part = self._stage_part
+        tables = self._part_offsets[(name, part)] if part else entry._component_offsets
+        base = self._stage_ptr + run.offset
+        items = []
+        for group in self._stage_groups:
+            for layer in group:
+                b = entry.layer_mapping.get(layer)
+                if b is not None:
+                    items.append([
+                        (base + run.blocks[(name, layer, c)][0], component[b][2], tables[c][b])
+                        for c, component in enumerate(entry.buffer_meta)
+                    ])
+        pages = len(keys) // n
+        idx = np.arange(pages, dtype=np.int64)
+        if entry.packed:
+            flat = [item for row in items for item in row]
+            ptr0 = np.array([item[0] for item in flat], np.int64)
+            size = np.array([item[1] for item in flat], np.int64)
+            ptrs = (ptr0[None, :] + idx[:, None] * size[None, :]).tolist()
+            sizes = [[item[1] for item in flat]] * pages
+            offsets = [[item[2] for item in flat]] * pages
+        else:
+            ptr0 = np.array([[row[c][0] for row in items] for c in range(n)], np.int64)
+            size = np.array([[row[c][1] for row in items] for c in range(n)], np.int64)
+            ptrs = (ptr0[None] + idx[:, None, None] * size[None]).reshape(pages * n, -1).tolist()
+            sizes = [[row[c][1] for row in items] for c in range(n)] * pages
+            offsets = [[row[c][2] for row in items] for c in range(n)] * pages
+        suffix = self._stage_suffix
+        keys = [key + suffix for key in keys] if suffix else keys
+        step = self._entries_per_call(sizes)
+        ok = []
+        for start in range(0, len(keys), step):
+            end = start + step
+            ok.extend(
+                bool(value)
+                for value in self.storage2.client.batch_get_ranges_into_ptr(
+                    keys[start:end], ptrs[start:end], sizes[start:end], offsets[start:end]
+                )
+            )
+        return [all(ok[i * n : (i + 1) * n]) for i in range(pages)]
+
+    def _stage_reserve(self, rid: str, size: int) -> tuple[int, int] | None:
+        """First-fit arena run; waits for loads to free space, in queue order."""
+        size = -(-size // _ARENA_ALIGN) * _ARENA_ALIGN
+        if size > self._stage_arena.numel():
+            self._stage_stats["too_big"] += 1
+            return None
+        deadline = time.monotonic() + STAGE_SPACE_WAIT_S
+        with self._stage_cv:
+            while True:
+                if rid in self._stage_gone:
+                    self._stage_stats["late"] += 1
+                    return None
+                for i, (offset, free) in enumerate(self._stage_free):
+                    if free >= size:
+                        if free == size:
+                            del self._stage_free[i]
+                        else:
+                            self._stage_free[i] = (offset + size, free - size)
+                        return offset, size
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    self._stage_stats["no_space"] += 1
+                    return None
+                self._stage_cv.wait(left)
+
+    def _doom_locked(self, run: _StageRun) -> None:
+        run.doomed = True
+        if run.ready and not run.busy:
+            self._free_run_locked(run)
+
+    def _free_run_locked(self, run: _StageRun) -> None:
+        if run.offset < 0:
+            return
+        for page_key in run.keys:
+            if self._staged.get(page_key, (None,))[0] is run:
+                del self._staged[page_key]
+        if self._stage_runs.get(run.rid) is run:
+            del self._stage_runs[run.rid]
+        merged = []
+        for offset, size in sorted([*self._stage_free, (run.offset, run.size)]):
+            if merged and sum(merged[-1]) == offset:
+                merged[-1] = (merged[-1][0], merged[-1][1] + size)
+            else:
+                merged.append((offset, size))
+        self._stage_free = merged
+        run.offset = -1
+        self._stage_cv.notify_all()
+
+    def _expire_stage(self, now: float) -> None:
+        with self._stage_cv:
+            for run in list(self._stage_runs.values()):
+                if run.ready and now - run.t0 > self._stage_lease:
+                    self._stage_stats["expired"] += 1
+                    self._doom_locked(run)
+            for marks in (self._stage_seen, self._stage_gone):
+                for rid in [rid for rid, t in marks.items() if now - t > 2 * self._stage_lease]:
+                    del marks[rid]
+
+    def _take_staged(self, stream, rids: list[str]):
+        """Split the second stream's pages into staged and direct; pins the runs used."""
+        storage, plans, groups, part, suffix = stream
+        with self._stage_cv:
+            inflight = [run for rid in rids if (run := self._stage_runs.get(rid)) and not run.ready]
+        t0 = time.monotonic()
+        for run in inflight:
+            run.done.wait(max(0.0, t0 + STAGE_WAIT_S - time.monotonic()))
+        direct, staged = [], {}
+        with self._stage_cv:
+            self._stage_stats["wait_ms"] += int((time.monotonic() - t0) * 1e3)
+            for plan in plans:
+                n = plan.entries_per_page
+                keep, by_run = [], {}
+                for i, row in enumerate(plan.locations):
+                    hit = self._staged.get((plan.name, plan.keys[i * n]))
+                    if hit is None or not hit[0].ready:
+                        keep.append(i)
+                        continue
+                    _, src, dst = by_run.setdefault(id(hit[0]), (hit[0], [], []))
+                    src.append(hit[1])
+                    dst.append(row)
+                for run, src, dst in by_run.values():
+                    staged.setdefault(id(run), (run, []))[1].append((plan.name, src, dst))
+                if keep:
+                    direct.append(_PoolRangePlan(
+                        plan.name,
+                        [plan.keys[i * n + j] for i in keep for j in range(n)],
+                        [plan.locations[i] for i in keep],
+                        n,
+                    ))
+                self._stage_stats["pages_staged"] += len(plan.locations) - len(keep)
+                self._stage_stats["pages_direct"] += len(keep)
+            for run, _ in staged.values():
+                run.busy += 1
+        return (storage, direct, groups, part, suffix), list(staged.values())
+
+    def _release_stage(self, staged, rids: list[str]) -> None:
+        now = time.monotonic()
+        with self._stage_cv:
+            runs = [run for run, _ in staged]
+            for run in runs:
+                run.busy -= 1
+            for rid in rids:
+                self._stage_loading.discard(rid)
+                self._stage_gone[rid] = now
+                if rid in self._stage_runs:
+                    runs.append(self._stage_runs[rid])
+                    runs[-1].doomed = True
+            for run in runs:
+                if run.doomed and run.ready and not run.busy:
+                    self._free_run_locked(run)
+
+    def _copy_staged_group(self, staged, group: list[int], scratch) -> int:
+        """Enqueue one group's staged pages: scratch-sized copies, then a scatter per block."""
+        nbytes = 0
+        for run, pools in staged:
+            for name, src, rows in pools:
+                entry = self.pools[name]
+                pages = run.pages[name]
+                # A pool's blocks within a group are adjacent in the run.
+                blocks = [
+                    (b, c, *run.blocks[(name, layer, c)])
+                    for layer in group
+                    if (b := entry.layer_mapping.get(layer)) is not None
+                    for c in range(len(entry.buffer_meta))
+                ]
+                i = 0
+                while i < len(blocks):
+                    first, j = blocks[i][2], i + 1
+                    while j < len(blocks) and blocks[j][2] + pages * blocks[j][3] - first <= scratch.numel():
+                        j += 1
+                    last = blocks[j - 1][2] + pages * blocks[j - 1][3]
+                    buf = scratch[: last - first]
+                    buf.copy_(
+                        self._stage_arena[run.offset + first : run.offset + last], non_blocking=True
+                    )
+                    nbytes += last - first
+                    for b, c, pos, size in blocks[i:j]:
+                        block = buf[pos - first : pos - first + pages * size].view(pages, size)
+                        self._scatter(entry, c, b, block.index_select(0, src), rows)
+                    i = j
+        return nbytes
+
+    def _scatter(self, entry, c: int, b: int, data: torch.Tensor, rows: torch.Tensor) -> None:
+        """Write page rows the way a direct get would: size bytes at row * stride."""
+        ptr, stride, _ = entry.buffer_meta[c][b]
+        size = data.shape[1]
+        unit = math.gcd(stride, size)
+        dst = self._stage_dst.get((ptr, unit))
+        if dst is None:
+            tensor = entry.components[c][b]
+            offset = tensor.storage_offset() * tensor.element_size()
+            nbytes = tensor.untyped_storage().nbytes() - offset
+            flat = torch.empty(0, dtype=torch.uint8, device=tensor.device)
+            flat.set_(tensor.untyped_storage(), offset, (nbytes // unit * unit,))
+            if flat.data_ptr() != ptr:
+                raise RuntimeError(f"UMBP stage scatter: buffer at 0x{flat.data_ptr():x}, meta 0x{ptr:x}.")
+            dst = self._stage_dst[(ptr, unit)] = flat.view(-1, unit)
+        index = rows * (stride // unit)
+        if size > unit:
+            index = (index[:, None] + torch.arange(size // unit, device=rows.device)).reshape(-1)
+        dst[index] = data.reshape(-1, unit)
 
     def _register_buffers(self) -> None:
         seen = set()
@@ -700,6 +1158,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         if rid in self._pending:
             raise RuntimeError(f"UMBP load for rid={rid} is already queued.")
         self._pending[rid] = expanded
+        if self._stage_arena is not None:
+            with self._stage_cv:
+                self._stage_loading.add(rid)
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
@@ -883,7 +1344,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                     return
                 counter_index, rids, plans, ready_event = task
                 try:
-                    self._run_layer_wise_batch(counter_index, plans, ready_event)
+                    self._run_layer_wise_batch(counter_index, plans, ready_event, rids)
                 finally:
                     self._completed_loads.put(rids)
             finally:
@@ -1018,13 +1479,20 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return max(1, RANGES_PER_CALL // max(1, ranges_per_object))
 
     def _run_layer_wise_batch(
-        self, counter_index: int, plans: list[_PoolRangePlan], ready_event: object
+        self,
+        counter_index: int,
+        plans: list[_PoolRangePlan],
+        ready_event: object,
+        rids: list[str] = (),
     ) -> None:
+        staged = []
         try:
             t0 = time.perf_counter()
             ready_event.synchronize()
             ready_ms = (time.perf_counter() - t0) * 1e3
             streams = self._load_streams(plans)
+            if self._stage_arena is not None:
+                streams[1], staged = self._take_staged(streams[1], rids)
             stats = [([], defaultdict(int)) for _ in streams]
             # A group is released once every stream that covers it is done.
             pending: dict[int, int] = defaultdict(int)
@@ -1052,7 +1520,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
 
             second = None
             if len(streams) > 1:
-                second = self._split_executor.submit(self._run_stream, streams[1], stats[1], finish)
+                second = self._split_executor.submit(
+                    self._run_stream, streams[1], stats[1], finish, staged
+                )
             try:
                 self._run_stream(streams[0], stats[0], finish)
             finally:
@@ -1061,6 +1531,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("UMBP layer-wise load batch failed")
+        finally:
+            if self._stage_arena is not None:
+                self._release_stage(staged, rids)
 
     def _load_streams(self, plans: list[_PoolRangePlan]):
         """(storage, plans, layer groups, part, key suffix) per parallel stream."""
@@ -1096,7 +1569,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                     )
         return first, second
 
-    def _run_stream(self, stream, stat, finish: Callable[[list[int]], None]) -> None:
+    def _run_stream(self, stream, stat, finish: Callable[[list[int]], None], staged=()) -> None:
         storage, plans, groups, part, suffix = stream
         grp_ms, nbytes = stat
         by_layer: dict[int, list[_PoolRangePlan]] = defaultdict(list)
@@ -1104,8 +1577,40 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             for logical_layer in self.pool_layers[plan.name]:
                 by_layer[logical_layer].append(plan)
 
+        copy_ctx, scratch = contextlib.nullcontext, None
+        if staged:
+            device = next(iter(self.pools.values())).components[0][0].device
+            if device.type != "cpu":
+                if self._stage_stream is None:
+                    self._stage_stream = device_module.Stream(device=device)
+
+                @contextlib.contextmanager
+                def copy_ctx():
+                    with device_module.device(device), device_module.stream(self._stage_stream):
+                        yield
+
+            with copy_ctx():
+                staged = [
+                    (run, [
+                        (name, torch.tensor(src, device=device), torch.tensor(dst, device=device))
+                        for name, src, dst in pools
+                    ])
+                    for run, pools in staged
+                ]
+                block = max(
+                    run.pages[name] * size
+                    for run, _ in staged
+                    for (name, _, _), (_, size) in run.blocks.items()
+                )
+                scratch = torch.empty(max(block, STAGE_SCRATCH), dtype=torch.uint8, device=device)
+
         for group in groups:
             t_group = time.perf_counter()
+            if staged:
+                with copy_ctx():
+                    copied = self._copy_staged_group(staged, group, scratch)
+                if LW_STATS:
+                    nbytes["STAGED"] += copied
             for plan in self._plans_covering(by_layer, group):
                 meta = self._layer_group_ranges(plan, group, part)
                 if meta is None:
@@ -1137,6 +1642,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                             f"success={sum(bool(value) for value in results)}/"
                             f"{len(chunk_keys)}."
                         )
+            if staged and self._stage_stream is not None:
+                self._stage_stream.synchronize()
             grp_ms.append(round((time.perf_counter() - t_group) * 1e3, 1))
             finish(group)
 
@@ -1343,11 +1850,20 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # down every registered region. Keep the GPU tensors alive until
             # the synchronous RPC has completed successfully.
             self.storage.client.deregister_memory(self._registered[0][0])
+        if self._stage_arena is not None:
+            self._stage_exec.shutdown(wait=True)
+            logger.info("UMBPSTAGE final %s", dict(self._stage_stats))
         if self.storage2 is not None:
             self._split_executor.shutdown(wait=True)
             if self._standalone_process_mode and self._registered:
                 self.storage2.client.deregister_memory(self._registered[0][0])
             self.storage2.close()
+        if getattr(self, "_stage_handle", None) is not None:
+            if self._stage_pinned:
+                torch.cuda.cudart().cudaHostUnregister(self._stage_ptr)
+            self._stage_arena = None
+            self._stage_alloc.free(self._stage_handle)
+            self._stage_handle = None
         logger.info("UMBP direct linker stats: %s", self._stats)
         self.storage.close()
         self._closed = True
