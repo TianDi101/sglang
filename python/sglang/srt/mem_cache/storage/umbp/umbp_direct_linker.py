@@ -95,12 +95,17 @@ def _install_stage_hook() -> None:
 
     def get_new_batch_prefill(self, *args, **kwargs):
         linker = getattr(getattr(self.tree_cache, "linker", None), "cache_linker", None)
+        start = time.perf_counter()
         if getattr(linker, "_stage_arena", None) is not None and self.waiting_queue:
             try:
                 linker.stage_ahead(self.waiting_queue, self.tree_cache)
             except Exception:
                 logger.exception("UMBP stage-ahead failed")
-        return build(self, *args, **kwargs)
+        try:
+            return build(self, *args, **kwargs)
+        finally:
+            if LW_STATS and linker is not None:
+                linker._time("build", start)
 
     Scheduler.get_new_batch_prefill = get_new_batch_prefill
     Scheduler._umbp_stage_hook = True
@@ -538,6 +543,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # offload / offload_batches is the coalescing actually achieved.
             "offload_batches": 0,
         }
+        # LW_STATS: scheduler-thread ms in lookups and prefill builds.
+        self._lk: dict[str, float] = defaultdict(float)
+        self._lk_next_log = 0.0
+        if LW_STATS:
+            _install_stage_hook()
         self._load_thread = threading.Thread(
             target=self._load_thread_func,
             daemon=True,
@@ -1159,6 +1169,24 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        start = time.perf_counter()
+        try:
+            return self._lookup(rid, transfers)
+        finally:
+            if LW_STATS:
+                self._time("lookup", start)
+
+    def _time(self, name: str, start: float) -> None:
+        now = time.perf_counter()
+        ms = (now - start) * 1e3
+        self._lk[f"{name}_ms"] += ms
+        self._lk[f"{name}s"] += 1
+        self._lk[f"{name}_max_ms"] = max(self._lk[f"{name}_max_ms"], ms)
+        if now >= self._lk_next_log:
+            self._lk_next_log = now + 60
+            logger.info("UMBPLK %s", {k: round(v, 1) for k, v in self._lk.items()})
+
+    def _lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
