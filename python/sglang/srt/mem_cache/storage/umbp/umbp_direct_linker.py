@@ -82,6 +82,7 @@ STAGE_RECHECK_S = float(os.getenv("UMBP_STAGE_RECHECK_S", "2"))
 STAGE_HEAD = int(os.getenv("UMBP_STAGE_HEAD", "8"))
 # Arena run size cap; a request stages as several runs.
 STAGE_CHUNK = int(os.getenv("UMBP_STAGE_CHUNK_MB", "64")) << 20
+STAGE_READS = int(os.getenv("UMBP_STAGE_READS", "4"))
 # Device scratch for staged host-to-device copies; a larger block gets its own.
 STAGE_SCRATCH = int(os.getenv("UMBP_STAGE_SCRATCH_MB", "64")) << 20
 _ARENA_ALIGN = 4096
@@ -700,6 +701,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._stage_stream = None
         self._stage_next_expire = self._stage_next_log = time.monotonic()
         self._stage_exec = ThreadPoolExecutor(1, thread_name_prefix=f"umbp-stage-tp{tp_rank}")
+        self._stage_reads = ThreadPoolExecutor(STAGE_READS, thread_name_prefix=f"umbp-stage-read-tp{tp_rank}")
         layer = self.split_mode == "layer"
         # Group-major like the second load stream, so a group's copy is contiguous.
         self._stage_groups = (
@@ -823,23 +825,31 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         # Bounded chunks, prefix first: a full or fragmented arena still takes the head.
         per = max(1, STAGE_CHUNK // sum(self._stage_page_bytes[name] for name in todo))
         most = max(len(keys) // n for n, keys in todo.values())
-        for start in range(0, most, per):
-            chunk = {
-                name: (n, keys[start * n : (start + per) * n])
-                for name, (n, keys) in todo.items()
-                if len(keys) > start * n
-            }
-            if not self._stage_run(rid, chunk):
-                return
+        reads = []
+        try:
+            for start in range(0, most, per):
+                chunk = {
+                    name: (n, keys[start * n : (start + per) * n])
+                    for name, (n, keys) in todo.items()
+                    if len(keys) > start * n
+                }
+                run = self._stage_begin(rid, chunk)
+                if run is None:
+                    break
+                # Chunks read in parallel: a short queue leaves little time to stage.
+                reads.append(self._stage_reads.submit(self._stage_run, run, chunk))
+        finally:
+            for read in reads:
+                read.result()
 
-    def _stage_run(self, rid: str, todo: dict[PoolName, tuple[int, list[str]]]) -> bool:
+    def _stage_begin(self, rid: str, todo: dict[PoolName, tuple[int, list[str]]]):
+        """Reserve a run and claim its pages; None when the arena has no room."""
         counts = {name: len(keys) // n for name, (n, keys) in todo.items()}
         blocks, size = self._stage_layout(counts)
         reserved = self._stage_reserve(rid, size)
         if reserved is None:
-            return False
-        t0 = time.monotonic()
-        run = _StageRun(rid, *reserved, t0, threading.Event(), counts, blocks, [])
+            return None
+        run = _StageRun(rid, *reserved, time.monotonic(), threading.Event(), counts, blocks, [])
         with self._stage_cv:
             for name, (n, keys) in todo.items():
                 for i in range(counts[name]):
@@ -848,6 +858,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         self._staged[page_key] = (run, i)
                         run.keys.append(page_key)
             self._stage_runs.setdefault(rid, []).append(run)
+        return run
+
+    def _stage_run(self, run: _StageRun, todo: dict[PoolName, tuple[int, list[str]]]) -> None:
+        size, t0 = run.size, run.t0
         failed = []
         try:
             for name, (n, keys) in todo.items():
@@ -869,7 +883,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 self._stage_stats["stage_ms"] += int((time.monotonic() - t0) * 1e3)
                 if run.doomed and not run.busy:
                     self._free_run_locked(run)
-        return True
 
     def _stage_layout(self, counts: dict[PoolName, int]):
         blocks, pos = {}, 0
@@ -1956,6 +1969,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             self.storage.client.deregister_memory(self._registered[0][0])
         if self._stage_arena is not None:
             self._stage_exec.shutdown(wait=True)
+            self._stage_reads.shutdown(wait=True)
             logger.info("UMBPSTAGE final %s", dict(self._stage_stats))
         if self.storage2 is not None:
             self._split_executor.shutdown(wait=True)
