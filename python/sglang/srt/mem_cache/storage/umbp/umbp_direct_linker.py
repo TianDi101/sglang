@@ -54,6 +54,8 @@ RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
 STAGE_WAIT_S = float(os.getenv("UMBP_STAGE_WAIT_S", "5"))
 # A queued request is re-checked this often: its prefix keeps leaving HBM and landing on SSD.
 STAGE_RECHECK_S = float(os.getenv("UMBP_STAGE_RECHECK_S", "2"))
+# The queue head stages its HBM pages too: admitting a batch evicts the next requests' prefixes.
+STAGE_HEAD = int(os.getenv("UMBP_STAGE_HEAD", "8"))
 # Arena run size cap; a request stages as several runs.
 STAGE_CHUNK = int(os.getenv("UMBP_STAGE_CHUNK_MB", "64")) << 20
 # Device scratch for staged host-to-device copies; a larger block gets its own.
@@ -684,7 +686,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     def stage_ahead(self, waiting_queue, cache) -> None:
         """Scheduler thread: hand queued requests to the stage thread, again every recheck."""
         now = time.monotonic()
-        for req in waiting_queue[: self._stage_depth]:
+        for pos, req in enumerate(waiting_queue[: self._stage_depth]):
             rid = req.rid
             if rid in self._stage_waiting or now - self._stage_seen.get(rid, -1e9) < STAGE_RECHECK_S:
                 continue
@@ -693,7 +695,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             self._stage_seen[rid] = now
             key = RadixKey(req.origin_input_ids, extra_key=req.extra_key, cache_salt=req.cache_salt)
             # Read-only and re-read every recheck: HBM pages are staged once evicted.
-            device_len = cache.tree_core.match_full_device_prefix(key)[0]
+            device_len = 0 if pos < STAGE_HEAD else cache.tree_core.match_full_device_prefix(key)[0]
             key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
             with self._stage_cv:
                 self._stage_waiting.add(rid)
