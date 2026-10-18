@@ -52,14 +52,14 @@ RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
 
 # Stage-ahead: a load waits this long for its request's in-flight staging.
 STAGE_WAIT_S = float(os.getenv("UMBP_STAGE_WAIT_S", "5"))
-# A request waits this long for arena space before it is left to direct reads.
-STAGE_SPACE_WAIT_S = float(os.getenv("UMBP_STAGE_SPACE_WAIT_S", "30"))
+# A queued request is re-checked this often: its prefix keeps leaving HBM and landing on SSD.
+STAGE_RECHECK_S = float(os.getenv("UMBP_STAGE_RECHECK_S", "2"))
 # Device scratch for staged host-to-device copies; a larger block gets its own.
 STAGE_SCRATCH = int(os.getenv("UMBP_STAGE_SCRATCH_MB", "64")) << 20
 _ARENA_ALIGN = 4096
 
 
-@dataclass
+@dataclass(eq=False)
 class _StageRun:
     """One request's staged second-server objects in one arena run.
 
@@ -645,10 +645,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._stage_ptr = arena.data_ptr()
         self._stage_cv = threading.Condition()
         self._stage_free = [(0, arena.numel())]
-        self._stage_runs: dict[str, _StageRun] = {}
+        self._stage_runs: dict[str, list[_StageRun]] = {}
         # (pool, first object key of a page) -> (run, page index in the run)
         self._staged: dict[tuple[PoolName, str], tuple[_StageRun, int]] = {}
         self._stage_seen: dict[str, float] = {}
+        # rid -> {pool: (page count per object, second-server object keys)}
+        self._stage_objs: dict[str, dict] = {}
         self._stage_waiting: set[str] = set()
         self._stage_loading: set[str] = set()
         self._stage_gone: dict[str, float] = {}
@@ -667,32 +669,32 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._stage_part, self._stage_suffix = ("back", "|b") if layer else (None, "")
 
     def stage_ahead(self, waiting_queue, cache) -> None:
-        """Scheduler thread: hand each queued request to the stage thread once."""
+        """Scheduler thread: hand queued requests to the stage thread, again every recheck."""
         now = time.monotonic()
-        tree = cache.tree_core
         for req in waiting_queue[: self._stage_depth]:
-            if req.rid in self._stage_seen:
+            rid = req.rid
+            if rid in self._stage_waiting or now - self._stage_seen.get(rid, -1e9) < STAGE_RECHECK_S:
                 continue
             from sglang.srt.mem_cache.radix_cache import RadixKey
 
-            self._stage_seen[req.rid] = now
+            self._stage_seen[rid] = now
+            # HBM residency is ignored: a queued prefix is mostly evicted by admission.
             key = RadixKey(req.origin_input_ids, extra_key=req.extra_key, cache_salt=req.cache_salt)
-            # Read-only; pages already in HBM are not worth SSD bandwidth.
-            device_len = tree.match_full_device_prefix(key)[0]
-            key, _ = key.maybe_to_bigram_view(tree.is_eagle)
+            key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
             with self._stage_cv:
-                self._stage_waiting.add(req.rid)
-            self._stage_exec.submit(self._stage_request, req.rid, key, device_len)
+                self._stage_waiting.add(rid)
+            self._stage_exec.submit(self._stage_request, rid, key)
         if self._stage_runs or self._stage_waiting:
             queued = {req.rid for req in waiting_queue}
             with self._stage_cv:
-                # Admitted without a load, or aborted: nothing will consume the run.
+                # Admitted without a load, or aborted: nothing will consume the runs.
                 for rid in [*self._stage_runs, *self._stage_waiting]:
                     if rid not in queued and rid not in self._stage_loading:
                         self._stage_gone[rid] = now
                         self._stage_waiting.discard(rid)
-                        if rid in self._stage_runs:
-                            self._doom_locked(self._stage_runs[rid])
+                        self._stage_objs.pop(rid, None)
+                        for run in list(self._stage_runs.get(rid, ())):
+                            self._doom_locked(run)
         if now >= self._stage_next_expire:
             self._stage_next_expire = now + 5
             self._expire_stage(now)
@@ -702,9 +704,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 used = self._stage_arena.numel() - sum(size for _, size in self._stage_free)
             logger.info("UMBPSTAGE used_mb=%d %s", used >> 20, dict(self._stage_stats))
 
-    def _stage_request(self, rid: str, key, device_len: int) -> None:
+    def _stage_request(self, rid: str, key) -> None:
         try:
-            self._stage_one(rid, key, device_len)
+            self._stage_one(rid, key)
         except Exception:
             self._stage_stats["errors"] += 1
             logger.exception("UMBP stage of rid=%s failed", rid)
@@ -718,42 +720,45 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         n = len(key) // self.page_size * self.page_size
         return get_storage_hash_str(key[:n], None, page_size=self.page_size) if n else []
 
-    def _stage_pages(self, hashes: list[str]) -> dict[PoolName, tuple[int, list[str]]]:
-        """Second-server object keys per pool, for the pages a load could restore."""
+    def _stage_objects(self, key) -> dict[PoolName, tuple[int, list[str]]]:
+        """Second-server object keys per pool for every page of the prompt."""
+        hashes = self._stage_hashes(key)
         transfers = self.pool_group.resolve_transfers(
             [PoolTransfer(name=PoolName.KV, keys=hashes)], allow_partial=True
         )
-        # Loads stop at the first page missing on either server.
-        end = len(hashes)
-        for transfer in transfers:
-            exists = self._page_exists(hashes[:end], transfer)
-            end = next((i for i, e in enumerate(exists) if not e), end)
-        chosen = {}
+        objects = {}
         for transfer in transfers:
             if self.split_mode == "layer":
                 if not self._part_layers(transfer.name, "back"):
                     continue
-                pages = hashes[:end]
+                pages = hashes
             else:
-                pages = [k for k, r in zip(hashes[:end], self._page_routes(hashes[:end])) if r]
+                pages = [k for k, r in zip(hashes, self._page_routes(hashes)) if r]
             if pages:
                 keys, n = self._object_keys_for_pages(pages, transfer)
-                chosen[transfer.name] = (n, keys)
-        return chosen
+                objects[transfer.name] = (n, keys)
+        return objects
 
-    def _stage_one(self, rid: str, key, device_len: int) -> None:
+    def _stage_one(self, rid: str, key) -> None:
         if rid in self._stage_gone:
             self._stage_stats["late"] += 1
             return
-        hashes = self._stage_hashes(key)[device_len // self.page_size :]
-        chosen = self._stage_pages(hashes)
+        objects = self._stage_objs.get(rid)
+        if objects is None:
+            objects = self._stage_objs[rid] = self._stage_objects(key)
         todo = {}
-        with self._stage_cv:
-            # A page another queued request staged is shared, not read twice.
-            for name, (n, keys) in chosen.items():
+        for name, (n, keys) in objects.items():
+            with self._stage_cv:
+                # A page another queued request staged is shared, not read twice.
                 fresh = [i for i in range(len(keys) // n) if (name, keys[i * n]) not in self._staged]
-                if fresh:
-                    todo[name] = (n, [keys[i * n + j] for i in fresh for j in range(n)])
+            names = [keys[i * n + j] + self._stage_suffix for i in fresh for j in range(n)]
+            step = CHUNK_PAGES * self.num_layers
+            found = []
+            for start in range(0, len(names), step):
+                found.extend(self.storage2.client.batch_exists(names[start : start + step]))
+            ready = [i for k, i in enumerate(fresh) if all(found[k * n : (k + 1) * n])]
+            if ready:
+                todo[name] = (n, [keys[i * n + j] for i in ready for j in range(n)])
         if not todo:
             self._stage_stats["nothing"] += 1
             return
@@ -771,7 +776,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                     if page_key not in self._staged:
                         self._staged[page_key] = (run, i)
                         run.keys.append(page_key)
-            self._stage_runs[rid] = run
+            self._stage_runs.setdefault(rid, []).append(run)
         failed = []
         try:
             for name, (n, keys) in todo.items():
@@ -787,7 +792,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         del self._staged[page_key]
                 run.ready = True
                 run.done.set()
-                self._stage_stats["requests"] += 1
+                self._stage_stats["runs"] += 1
                 self._stage_stats["bytes_mb"] += size >> 20
                 self._stage_stats["failed_pages"] += len(failed)
                 self._stage_stats["stage_ms"] += int((time.monotonic() - t0) * 1e3)
@@ -853,29 +858,21 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return [all(ok[i * n : (i + 1) * n]) for i in range(pages)]
 
     def _stage_reserve(self, rid: str, size: int) -> tuple[int, int] | None:
-        """First-fit arena run; waits for loads to free space, in queue order."""
+        """First-fit arena run; when full, the next recheck retries."""
         size = -(-size // _ARENA_ALIGN) * _ARENA_ALIGN
-        if size > self._stage_arena.numel():
-            self._stage_stats["too_big"] += 1
-            return None
-        deadline = time.monotonic() + STAGE_SPACE_WAIT_S
         with self._stage_cv:
-            while True:
-                if rid in self._stage_gone:
-                    self._stage_stats["late"] += 1
-                    return None
-                for i, (offset, free) in enumerate(self._stage_free):
-                    if free >= size:
-                        if free == size:
-                            del self._stage_free[i]
-                        else:
-                            self._stage_free[i] = (offset + size, free - size)
-                        return offset, size
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    self._stage_stats["no_space"] += 1
-                    return None
-                self._stage_cv.wait(left)
+            if rid in self._stage_gone:
+                self._stage_stats["late"] += 1
+                return None
+            for i, (offset, free) in enumerate(self._stage_free):
+                if free >= size:
+                    if free == size:
+                        del self._stage_free[i]
+                    else:
+                        self._stage_free[i] = (offset + size, free - size)
+                    return offset, size
+            self._stage_stats["no_space"] += 1
+            return None
 
     def _doom_locked(self, run: _StageRun) -> None:
         run.doomed = True
@@ -888,8 +885,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         for page_key in run.keys:
             if self._staged.get(page_key, (None,))[0] is run:
                 del self._staged[page_key]
-        if self._stage_runs.get(run.rid) is run:
-            del self._stage_runs[run.rid]
+        runs = self._stage_runs.get(run.rid, [])
+        if run in runs:
+            runs.remove(run)
+            if not runs:
+                del self._stage_runs[run.rid]
         merged = []
         for offset, size in sorted([*self._stage_free, (run.offset, run.size)]):
             if merged and sum(merged[-1]) == offset:
@@ -902,19 +902,21 @@ class UMBPDirectLinker(UnifiedCacheLinker):
 
     def _expire_stage(self, now: float) -> None:
         with self._stage_cv:
-            for run in list(self._stage_runs.values()):
+            for run in [run for runs in self._stage_runs.values() for run in runs]:
                 if run.ready and now - run.t0 > self._stage_lease:
                     self._stage_stats["expired"] += 1
                     self._doom_locked(run)
             for marks in (self._stage_seen, self._stage_gone):
                 for rid in [rid for rid, t in marks.items() if now - t > 2 * self._stage_lease]:
                     del marks[rid]
+            for rid in [rid for rid in self._stage_objs if rid not in self._stage_seen]:
+                del self._stage_objs[rid]
 
     def _take_staged(self, stream, rids: list[str]):
         """Split the second stream's pages into staged and direct; pins the runs used."""
         storage, plans, groups, part, suffix = stream
         with self._stage_cv:
-            inflight = [run for rid in rids if (run := self._stage_runs.get(rid)) and not run.ready]
+            inflight = [run for rid in rids for run in self._stage_runs.get(rid, ()) if not run.ready]
         t0 = time.monotonic()
         for run in inflight:
             run.done.wait(max(0.0, t0 + STAGE_WAIT_S - time.monotonic()))
@@ -956,9 +958,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             for rid in rids:
                 self._stage_loading.discard(rid)
                 self._stage_gone[rid] = now
-                if rid in self._stage_runs:
-                    runs.append(self._stage_runs[rid])
-                    runs[-1].doomed = True
+                self._stage_objs.pop(rid, None)
+                for run in self._stage_runs.get(rid, ()):
+                    run.doomed = True
+                    runs.append(run)
             for run in runs:
                 if run.doomed and run.ready and not run.busy:
                     self._free_run_locked(run)
