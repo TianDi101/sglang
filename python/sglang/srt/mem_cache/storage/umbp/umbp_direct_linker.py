@@ -83,11 +83,30 @@ STAGE_HEAD = int(os.getenv("UMBP_STAGE_HEAD", "8"))
 # Arena run size cap; a request stages as several runs.
 STAGE_CHUNK = int(os.getenv("UMBP_STAGE_CHUNK_MB", "64")) << 20
 STAGE_READS = int(os.getenv("UMBP_STAGE_READS", "4"))
-# Direct load reads in flight per rank; 0 reads one layer group at a time.
+# Direct second-stream reads in flight per rank; 0 reads one layer group at a time.
 LOAD_READS = int(os.getenv("UMBP_LOAD_READS", "0"))
+# Page split on one tiered server: its "dram:ssd" tier weights, so the second stream takes the SSD objects.
+SPLIT_WEIGHTS = os.getenv("UMBP_SPLIT_WEIGHTS", "")
 # Device scratch for staged host-to-device copies; a larger block gets its own.
 STAGE_SCRATCH = int(os.getenv("UMBP_STAGE_SCRATCH_MB", "64")) << 20
 _ARENA_ALIGN = 4096
+
+
+def _fnv1a(keys: list[str]) -> np.ndarray:
+    """UMBP's StablePlacementHash (64-bit FNV-1a) per key, a byte column at a time."""
+    out = np.empty(len(keys), np.uint64)
+    by_len: dict[int, list[int]] = defaultdict(list)
+    raw = [key.encode() for key in keys]
+    for i, b in enumerate(raw):
+        by_len[len(b)].append(i)
+    for length, idx in by_len.items():
+        cols = np.frombuffer(b"".join(raw[i] for i in idx), np.uint8).reshape(len(idx), length)
+        h = np.full(len(idx), 14695981039346656037, np.uint64)
+        for col in cols.T:
+            h ^= col
+            h *= np.uint64(1099511628211)
+        out[idx] = h
+    return out
 
 
 @dataclass(eq=False)
@@ -611,6 +630,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         )
         self._exists_executor = ThreadPoolExecutor(2, thread_name_prefix=f"umbp-exists-tp{tp_rank}")
         self._page_threshold = int(fraction * 1000)
+        self._placement = None
+        if SPLIT_WEIGHTS:
+            dram, ssd = (int(w) for w in SPLIT_WEIGHTS.split(":"))
+            self._placement = (dram, dram + ssd)
+            fraction = ssd / (dram + ssd)
         self.split_layer = None
         if self.split_mode == "layer":
             fraction = self._init_layer_split(fraction)
@@ -650,9 +674,15 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 self._part_sizes[(name, part)] = [offset] if entry.packed else sizes
         return back / max(1, sum(per_layer))
 
-    def _page_routes(self, page_keys: list[str]) -> list[bool]:
-        """Page split: a stable hash keeps every rank and pool on the same server."""
-        return [zlib.crc32(key.encode()) % 1000 < self._page_threshold for key in page_keys]
+    def _page_routes(self, page_keys: list[str], transfer: PoolTransfer) -> list[bool]:
+        """Page split: which pages the second stream takes, the same on every rank."""
+        if self._placement is None:
+            return [zlib.crc32(key.encode()) % 1000 < self._page_threshold for key in page_keys]
+        # The server places each object by its key; a page with any SSD object goes second.
+        dram, total = self._placement
+        keys, n = self._object_keys_for_pages(page_keys, transfer)
+        ssd = _fnv1a(keys) % np.uint64(total) >= dram
+        return ssd.reshape(len(page_keys), n).any(axis=1).tolist()
 
     def _part_layers(self, name: PoolName, part: str) -> list[int]:
         layers = self.pool_layers[name]
@@ -695,7 +725,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         # (pool, first object key of a page) -> (run, page index in the run)
         self._staged: dict[tuple[PoolName, str], tuple[_StageRun, int]] = {}
         self._stage_seen: dict[str, float] = {}
-        # rid -> (page hashes, page routes, {pool: [transfer, objects per page, keys, page known present]})
+        # rid -> (page hashes, {pool: page routes}, {pool: [transfer, objects per page, keys, page known present]})
         self._stage_objs: dict[str, tuple] = {}
         self._stage_waiting: set[str] = set()
         self._stage_loading: set[str] = set()
@@ -782,7 +812,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         transfers = self.pool_group.resolve_transfers(
             [PoolTransfer(name=PoolName.KV, keys=hashes)], allow_partial=True
         )
-        routes = self._page_routes(hashes) if self.split_mode == "page" else None
+        routes = (
+            {t.name: self._page_routes(hashes, t) for t in transfers} if self.split_mode == "page" else None
+        )
         pools = {}
         for transfer in transfers:
             keys, n = self._object_keys_for_pages(hashes, transfer)
@@ -820,7 +852,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 # A page another queued request staged is shared, not read twice.
                 fresh = [
                     i for i in range(first, end)
-                    if (routes is None or routes[i]) and (name, keys[i * n]) not in self._staged
+                    if (routes is None or routes[name][i]) and (name, keys[i * n]) not in self._staged
                 ]
             if fresh:
                 todo[name] = (n, [keys[i * n + j] for i in fresh for j in range(n)])
@@ -1166,7 +1198,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             ]
             return [all(values) for values in zip(*(r.result() for r in results))]
         if self.split_mode == "page":
-            routes = self._page_routes(page_keys)
+            routes = self._page_routes(page_keys, transfer)
             asks = []
             for storage, routed in ((self.storage, False), (self.storage2, True)):
                 keys = [k for k, r in zip(page_keys, routes) if r == routed]
@@ -1387,7 +1419,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             for transfer in transfers:
                 page_keys = list(transfer.keys or [])
                 if self.split_mode == "page":
-                    routes.extend(self._page_routes(page_keys))
+                    routes.extend(self._page_routes(page_keys, transfer))
                 transfer_keys, multiplier = self._object_keys_for_pages(
                     page_keys, transfer
                 )
@@ -1773,7 +1805,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             for call in (c for group_calls in calls for c in group_calls):
                 nbytes[call[0].name] += sum(sum(s) for s in call[3])
         pending = None
-        reads = getattr(self, "_load_reads", None)  # split mode only
+        # Second (SSD) stream only: first-stream DRAM reads keep pace group by group.
+        reads = self._load_reads if storage is self.storage2 else None
         if reads is not None and any(calls):
             # Queue every group's reads now, group 0 first, so the drives never idle between groups.
             pending = [
