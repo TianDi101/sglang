@@ -87,6 +87,8 @@ STAGE_READS = int(os.getenv("UMBP_STAGE_READS", "4"))
 LOAD_READS = int(os.getenv("UMBP_LOAD_READS", "0"))
 # Page split on one tiered server: its "dram:ssd" tier weights, so the second stream takes the SSD objects.
 SPLIT_WEIGHTS = os.getenv("UMBP_SPLIT_WEIGHTS", "")
+# The SSD member's min_object_size: smaller objects always place in DRAM.
+SPLIT_SSD_MIN = int(os.getenv("UMBP_SPLIT_SSD_MIN_BYTES", "0"))
 # Device scratch for staged host-to-device copies; a larger block gets its own.
 STAGE_SCRATCH = int(os.getenv("UMBP_STAGE_SCRATCH_MB", "64")) << 20
 _ARENA_ALIGN = 4096
@@ -681,8 +683,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         # The server places each object by its key; a page with any SSD object goes second.
         dram, total = self._placement
         keys, n = self._object_keys_for_pages(page_keys, transfer)
-        ssd = _fnv1a(keys) % np.uint64(total) >= dram
-        return ssd.reshape(len(page_keys), n).any(axis=1).tolist()
+        ssd = (_fnv1a(keys) % np.uint64(total) >= dram).reshape(len(page_keys), n)
+        ssd &= np.array(_object_sizes_per_page(self.pools[transfer.name])) >= SPLIT_SSD_MIN
+        return ssd.any(axis=1).tolist()
 
     def _part_layers(self, name: PoolName, part: str) -> list[int]:
         layers = self.pool_layers[name]
