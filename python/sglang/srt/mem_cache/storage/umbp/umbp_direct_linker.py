@@ -1142,7 +1142,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         # every layer, and a layer is read back as a byte range inside it.
         return component_keys, multiplier
 
-    def _page_exists(self, page_keys: list[str], transfer: PoolTransfer, rid: str | None = None) -> list[bool]:
+    def _page_exists(
+        self, page_keys: list[str], transfer: PoolTransfer, rid: str | None = None, acc: list | None = None
+    ) -> list[bool]:
         if self.split_mode == "layer":
             # A page is a hit only when every part it was written as survives.
             parts = [
@@ -1152,9 +1154,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             ]
             # Both servers at once: lookups block the lockstep DP ranks.
             results = [
-                self._exists_executor.submit(self._exists_unstaged, s, page_keys, transfer, suffix, rid)
+                self._exists_executor.submit(self._exists_unstaged, s, page_keys, transfer, suffix, rid, acc)
                 if s is self.storage2
-                else self._exists_executor.submit(self._exists_on, s, page_keys, transfer, suffix)
+                else self._exists_executor.submit(self._exists_on, s, page_keys, transfer, suffix, acc)
                 for s, suffix in parts
             ]
             return [all(values) for values in zip(*(r.result() for r in results))]
@@ -1164,23 +1166,27 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             for storage, routed in ((self.storage, False), (self.storage2, True)):
                 keys = [k for k, r in zip(page_keys, routes) if r == routed]
                 ask = (
-                    self._exists_executor.submit(self._exists_unstaged, storage, keys, transfer, "", rid)
+                    self._exists_executor.submit(self._exists_unstaged, storage, keys, transfer, "", rid, acc)
                     if routed
-                    else self._exists_executor.submit(self._exists_on, storage, keys, transfer)
+                    else self._exists_executor.submit(self._exists_on, storage, keys, transfer, "", acc)
                 )
                 asks.append((keys, ask))
             found = {k: v for keys, ask in asks for k, v in zip(keys, ask.result())}
             return [found[k] for k in page_keys]
-        return self._exists_on(self.storage, page_keys, transfer)
+        return self._exists_on(self.storage, page_keys, transfer, "", acc)
 
     def _exists_unstaged(
-        self, storage, page_keys: list[str], transfer: PoolTransfer, suffix: str, rid: str | None
+        self, storage, page_keys: list[str], transfer: PoolTransfer, suffix: str, rid: str | None,
+        acc: list | None = None,
     ) -> list[bool]:
         """Second server: pages this request already staged are present; ask only for the rest."""
         if self._stage_arena is None or rid is None or not page_keys:
-            return self._exists_on(storage, page_keys, transfer, suffix)
+            return self._exists_on(storage, page_keys, transfer, suffix, acc)
         keys, n = self._object_keys_for_pages(page_keys, transfer)
+        start = time.perf_counter()
         with self._stage_cv:
+            if acc is not None:
+                acc.append(("lock", time.perf_counter() - start))
             # Own runs only: they live until this request's load, another's may be freed first.
             staged = [
                 (hit := self._staged.get((transfer.name, keys[i * n]))) is not None
@@ -1188,11 +1194,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 for i in range(len(page_keys))
             ]
         ask = [key for key, done in zip(page_keys, staged) if not done]
-        found = iter(self._exists_on(storage, ask, transfer, suffix) if ask else ())
+        found = iter(self._exists_on(storage, ask, transfer, suffix, acc) if ask else ())
         return [done or next(found) for done in staged]
 
     def _exists_on(
-        self, storage, page_keys: list[str], transfer: PoolTransfer, suffix: str = ""
+        self, storage, page_keys: list[str], transfer: PoolTransfer, suffix: str = "",
+        acc: list | None = None,
     ) -> list[bool]:
         entry = self.pools[transfer.name]
         objects_per_page = 1 if entry.packed else len(entry.components)
@@ -1204,7 +1211,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             chunk_pages = page_keys[start : start + pages_per_call]
             object_keys, _ = self._object_keys_for_pages(chunk_pages, transfer)
             object_keys = [key + suffix for key in object_keys]
+            start = time.perf_counter()
             exists = list(storage.client.batch_exists(object_keys))
+            if acc is not None:
+                acc.append(("rpc", time.perf_counter() - start))
             if len(exists) != len(object_keys):
                 raise RuntimeError(
                     f"UMBP exists result-size mismatch for pool {transfer.name}: "
@@ -1264,18 +1274,25 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             return []
 
         valid_pages = list(range(1, len(page_keys) + 1))
+        # Lookup split for LW_STATS: scheduler time in _page_exists vs. RPC and stage-lock time under it.
+        acc = [] if LW_STATS else None
         for transfer in expanded:
             # Probe only as far as the surviving boundary: no hit policy reads
             # past its own end offset, so pages beyond the longest candidate
             # cannot change the answer. This runs synchronously inside the
             # scheduler's prefill batch build, and DP-attention ranks are
             # lockstep, so every extra key is stall charged to all of them.
-            page_exists = self._page_exists(page_keys[: valid_pages[-1]], transfer, rid)
+            start = time.perf_counter()
+            page_exists = self._page_exists(page_keys[: valid_pages[-1]], transfer, rid, acc)
+            if acc is not None:
+                acc.append(("exists", time.perf_counter() - start))
             valid_pages = self._apply_hit_policy(valid_pages, page_exists, transfer)
             if not valid_pages:
                 break
 
         self._stats["lookup"] += 1
+        for name, seconds in acc or ():
+            self._lk[f"{name}_ms"] += seconds * 1e3
         if valid_pages:
             logger.debug(
                 "UMBP direct linker lookup hit: rid=%s pages=%d candidates=%d",
