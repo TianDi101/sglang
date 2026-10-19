@@ -85,6 +85,8 @@ STAGE_CHUNK = int(os.getenv("UMBP_STAGE_CHUNK_MB", "64")) << 20
 STAGE_READS = int(os.getenv("UMBP_STAGE_READS", "4"))
 # Direct second-stream reads in flight per rank; 0 reads one layer group at a time.
 LOAD_READS = int(os.getenv("UMBP_LOAD_READS", "0"))
+# Layer groups those reads may run ahead by; 0 = all of a load's groups at once.
+LOAD_WINDOW = int(os.getenv("UMBP_LOAD_WINDOW", "0"))
 # Page split on one tiered server: its "dram:ssd" tier weights, so the second stream takes the SSD objects.
 SPLIT_WEIGHTS = os.getenv("UMBP_SPLIT_WEIGHTS", "")
 # The SSD member's min_object_size: smaller objects always place in DRAM.
@@ -1810,12 +1812,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         pending = None
         # The stream that reads SSD: the second in a split, else the only one.
         reads = self._load_reads if self.storage2 is None or storage is self.storage2 else None
+        window = LOAD_WINDOW or len(groups)
+        submit = lambda i: [reads.submit(self._get_ranges, storage, groups[i], call) for call in calls[i]]
         if reads is not None and any(calls):
-            # Queue every group's reads now, group 0 first, so the drives never idle between groups.
-            pending = [
-                [reads.submit(self._get_ranges, storage, group, call) for call in group_calls]
-                for group, group_calls in zip(groups, calls)
-            ]
+            # In order, at most `window` groups ahead: group 0 must not share the drives with every later group.
+            pending = [submit(i) if i < window else [] for i in range(len(groups))]
         try:
             for i, group in enumerate(groups):
                 t_group = time.perf_counter()
@@ -1830,6 +1831,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 else:
                     for future in pending[i]:
                         future.result()
+                    if i + window < len(groups):
+                        pending[i + window] = submit(i + window)
                 if staged and self._stage_stream is not None:
                     self._stage_stream.synchronize()
                 grp_ms.append(round((time.perf_counter() - t_group) * 1e3, 1))
