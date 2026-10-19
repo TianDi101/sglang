@@ -10,7 +10,7 @@ import threading
 import time
 import zlib
 from collections import defaultdict, deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any, Callable
@@ -83,6 +83,8 @@ STAGE_HEAD = int(os.getenv("UMBP_STAGE_HEAD", "8"))
 # Arena run size cap; a request stages as several runs.
 STAGE_CHUNK = int(os.getenv("UMBP_STAGE_CHUNK_MB", "64")) << 20
 STAGE_READS = int(os.getenv("UMBP_STAGE_READS", "4"))
+# Direct load reads in flight per rank; 0 reads one layer group at a time.
+LOAD_READS = int(os.getenv("UMBP_LOAD_READS", "0"))
 # Device scratch for staged host-to-device copies; a larger block gets its own.
 STAGE_SCRATCH = int(os.getenv("UMBP_STAGE_SCRATCH_MB", "64")) << 20
 _ARENA_ALIGN = 4096
@@ -604,6 +606,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             if not self.storage2.client.register_memory(*allocation):
                 raise RuntimeError(f"Failed to register a GPU KV buffer with {address}.")
         self._split_executor = ThreadPoolExecutor(1, thread_name_prefix=f"umbp-load2-tp{tp_rank}")
+        self._load_reads = (
+            ThreadPoolExecutor(LOAD_READS, thread_name_prefix=f"umbp-loadrd-tp{tp_rank}") if LOAD_READS else None
+        )
         self._exists_executor = ThreadPoolExecutor(2, thread_name_prefix=f"umbp-exists-tp{tp_rank}")
         self._page_threshold = int(fraction * 1000)
         self.split_layer = None
@@ -1763,48 +1768,66 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 size = max(STAGE_SCRATCH, max(run.size for run, _ in staged))
                 scratch = torch.empty(size, dtype=torch.uint8, device=device)
 
-        for group in groups:
-            t_group = time.perf_counter()
-            if staged:
-                with copy_ctx():
-                    copied = self._copy_staged_group(staged, group, scratch, rows)
-                if LW_STATS:
-                    nbytes["STAGED"] += copied
-            for plan in self._plans_covering(by_layer, group):
-                meta = self._layer_group_ranges(plan, group, part)
-                if meta is None:
-                    continue
-                ptrs, sizes, offsets = meta
-                step = self._entries_per_call(sizes)
-                if LW_STATS:
-                    nbytes[plan.name.name] += sum(sum(s) for s in sizes)
-                keys = [key + suffix for key in plan.keys] if suffix else plan.keys
-                for start in range(0, len(keys), step):
-                    end = start + step
-                    chunk_keys = keys[start:end]
-                    results = list(
-                        storage.client.batch_get_ranges_into_ptr(
-                            chunk_keys,
-                            ptrs[start:end],
-                            sizes[start:end],
-                            offsets[start:end],
-                        )
-                    )
-                    if len(results) != len(chunk_keys) or not all(results):
-                        where = (
-                            f"layer={group[0]}"
-                            if len(group) == 1
-                            else f"layers={group[0]}..{group[-1]}"
-                        )
-                        raise RuntimeError(
-                            f"UMBP get failed for pool={plan.name}, {where}: "
-                            f"success={sum(bool(value) for value in results)}/"
-                            f"{len(chunk_keys)}."
-                        )
-            if staged and self._stage_stream is not None:
-                self._stage_stream.synchronize()
-            grp_ms.append(round((time.perf_counter() - t_group) * 1e3, 1))
-            finish(group)
+        calls = [self._group_calls(by_layer, group, part, suffix) for group in groups]
+        if LW_STATS:
+            for call in (c for group_calls in calls for c in group_calls):
+                nbytes[call[0].name] += sum(sum(s) for s in call[3])
+        pending = None
+        reads = getattr(self, "_load_reads", None)  # split mode only
+        if reads is not None and any(calls):
+            # Queue every group's reads now, group 0 first, so the drives never idle between groups.
+            pending = [
+                [reads.submit(self._get_ranges, storage, group, call) for call in group_calls]
+                for group, group_calls in zip(groups, calls)
+            ]
+        try:
+            for i, group in enumerate(groups):
+                t_group = time.perf_counter()
+                if staged:
+                    with copy_ctx():
+                        copied = self._copy_staged_group(staged, group, scratch, rows)
+                    if LW_STATS:
+                        nbytes["STAGED"] += copied
+                if pending is None:
+                    for call in calls[i]:
+                        self._get_ranges(storage, group, call)
+                else:
+                    for future in pending[i]:
+                        future.result()
+                if staged and self._stage_stream is not None:
+                    self._stage_stream.synchronize()
+                grp_ms.append(round((time.perf_counter() - t_group) * 1e3, 1))
+                finish(group)
+        finally:
+            if pending is not None:
+                # A failed batch must not leave reads landing in KV pages it no longer owns.
+                wait([future for group_futures in pending for future in group_futures])
+
+    def _group_calls(self, by_layer, group: list[int], part, suffix: str) -> list[tuple]:
+        """One layer group's direct reads: (pool, keys, ptrs, sizes, offsets) per call."""
+        calls = []
+        for plan in self._plans_covering(by_layer, group):
+            meta = self._layer_group_ranges(plan, group, part)
+            if meta is None:
+                continue
+            ptrs, sizes, offsets = meta
+            step = self._entries_per_call(sizes)
+            keys = [key + suffix for key in plan.keys] if suffix else plan.keys
+            for start in range(0, len(keys), step):
+                end = start + step
+                calls.append((plan.name, keys[start:end], ptrs[start:end], sizes[start:end], offsets[start:end]))
+        return calls
+
+    @staticmethod
+    def _get_ranges(storage, group: list[int], call: tuple) -> None:
+        name, keys, ptrs, sizes, offsets = call
+        results = list(storage.client.batch_get_ranges_into_ptr(keys, ptrs, sizes, offsets))
+        if len(results) != len(keys) or not all(results):
+            where = f"layer={group[0]}" if len(group) == 1 else f"layers={group[0]}..{group[-1]}"
+            raise RuntimeError(
+                f"UMBP get failed for pool={name}, {where}: "
+                f"success={sum(bool(value) for value in results)}/{len(keys)}."
+            )
 
     def _layer_groups(self, start: int = 0, stop: int | None = None) -> list[list[int]]:
         stop = self.num_layers if stop is None else stop
