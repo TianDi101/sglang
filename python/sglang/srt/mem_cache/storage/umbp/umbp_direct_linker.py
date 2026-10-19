@@ -564,6 +564,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self.split_mode = os.getenv("UMBP_SPLIT_MODE", "")
         self.storage2 = None
         self._stage_arena = None
+        self._load_reads = (
+            ThreadPoolExecutor(LOAD_READS, thread_name_prefix=f"umbp-loadrd-tp{tp_rank}") if LOAD_READS else None
+        )
         if self.split_mode:
             try:
                 self._init_split(storage_config, tp_rank)
@@ -627,9 +630,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             if not self.storage2.client.register_memory(*allocation):
                 raise RuntimeError(f"Failed to register a GPU KV buffer with {address}.")
         self._split_executor = ThreadPoolExecutor(1, thread_name_prefix=f"umbp-load2-tp{tp_rank}")
-        self._load_reads = (
-            ThreadPoolExecutor(LOAD_READS, thread_name_prefix=f"umbp-loadrd-tp{tp_rank}") if LOAD_READS else None
-        )
         self._exists_executor = ThreadPoolExecutor(2, thread_name_prefix=f"umbp-exists-tp{tp_rank}")
         self._page_threshold = int(fraction * 1000)
         self._placement = None
@@ -1808,8 +1808,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             for call in (c for group_calls in calls for c in group_calls):
                 nbytes[call[0].name] += sum(sum(s) for s in call[3])
         pending = None
-        # Second (SSD) stream only: first-stream DRAM reads keep pace group by group.
-        reads = self._load_reads if storage is self.storage2 else None
+        # The stream that reads SSD: the second in a split, else the only one.
+        reads = self._load_reads if self.storage2 is None or storage is self.storage2 else None
         if reads is not None and any(calls):
             # Queue every group's reads now, group 0 first, so the drives never idle between groups.
             pending = [
