@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 from collections import defaultdict
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any, Callable
@@ -40,6 +40,12 @@ CHUNK_PAGES = 64
 # Budget by ranges because pool layouts attach different counts per object;
 # 8192 stays below gRPC's default message limit.
 RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
+
+# Read calls a load keeps in flight, so slow (SSD) objects overlap; 0 = one at a time.
+LOAD_READS = int(os.getenv("UMBP_LOAD_READS", "0"))
+# Layer groups read ahead of the one being released; bounded so later groups
+# do not delay the first. 0 = all.
+LOAD_WINDOW = int(os.getenv("UMBP_LOAD_WINDOW", "0"))
 
 
 def _storage_suffix(
@@ -420,6 +426,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             target=self._offload_thread_func,
             daemon=True,
             name=f"umbp-offload-tp{tp_rank}",
+        )
+        self._load_reads = (
+            ThreadPoolExecutor(LOAD_READS, thread_name_prefix=f"umbp-read-tp{tp_rank}")
+            if LOAD_READS > 0
+            else None
         )
         self._closed = False
         self._load_thread.start()
@@ -857,43 +868,81 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 for logical_layer in self.pool_layers[plan.name]:
                     by_layer[logical_layer].append(plan)
 
-            for group in self._layer_groups():
-                for plan in self._plans_covering(by_layer, group):
-                    meta = self._layer_group_ranges(plan, group)
-                    if meta is None:
-                        continue
-                    ptrs, sizes, offsets = meta
-                    step = self._entries_per_call(sizes)
-                    for start in range(0, len(plan.keys), step):
-                        end = start + step
-                        chunk_keys = plan.keys[start:end]
-                        results = list(
-                            self.storage.client.batch_get_ranges_into_ptr(
-                                chunk_keys,
-                                ptrs[start:end],
-                                sizes[start:end],
-                                offsets[start:end],
-                            )
-                        )
-                        if len(results) != len(chunk_keys) or not all(results):
-                            where = (
-                                f"layer={group[0]}"
-                                if len(group) == 1
-                                else f"layers={group[0]}..{group[-1]}"
-                            )
-                            raise RuntimeError(
-                                f"UMBP get failed for pool={plan.name}, {where}: "
-                                f"success={sum(bool(value) for value in results)}/"
-                                f"{len(chunk_keys)}."
-                            )
-                # Only now is every layer in the group readable, so they are
-                # released together. A group wider than 1 trades overlap
-                # granularity for fewer times each object is named on the wire.
-                for logical_layer in group:
-                    self.layer_done_counter.complete(counter_index, logical_layer)
+            groups = self._layer_groups()
+            reads = self._load_reads
+            window = LOAD_WINDOW or len(groups)
+
+            def submit(index: int) -> list[Future]:
+                group = groups[index]
+                return [
+                    reads.submit(self._get_ranges, group, *call)
+                    for call in self._group_calls(by_layer, group)
+                ]
+
+            pending = None
+            if reads is not None:
+                pending = [submit(i) if i < window else [] for i in range(len(groups))]
+            try:
+                for i, group in enumerate(groups):
+                    if pending is None:
+                        for call in self._group_calls(by_layer, group):
+                            self._get_ranges(group, *call)
+                    else:
+                        for future in pending[i]:
+                            future.result()
+                        if i + window < len(groups):
+                            pending[i + window] = submit(i + window)
+                    # Only now is every layer in the group readable, so they are
+                    # released together. A group wider than 1 trades overlap
+                    # granularity for fewer times each object is named on the wire.
+                    for logical_layer in group:
+                        self.layer_done_counter.complete(counter_index, logical_layer)
+            finally:
+                if pending is not None:
+                    # A failed batch must not leave reads landing in pages it gave up.
+                    wait([future for futures in pending for future in futures])
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("UMBP layer-wise load batch failed")
+
+    def _group_calls(
+        self, by_layer: dict[int, list[_PoolRangePlan]], group: list[int]
+    ) -> list[tuple]:
+        """One layer group's reads as (pool, keys, ptrs, sizes, offsets) per call."""
+        calls = []
+        for plan in self._plans_covering(by_layer, group):
+            meta = self._layer_group_ranges(plan, group)
+            if meta is None:
+                continue
+            ptrs, sizes, offsets = meta
+            step = self._entries_per_call(sizes)
+            for start in range(0, len(plan.keys), step):
+                end = start + step
+                calls.append(
+                    (
+                        plan.name,
+                        plan.keys[start:end],
+                        ptrs[start:end],
+                        sizes[start:end],
+                        offsets[start:end],
+                    )
+                )
+        return calls
+
+    def _get_ranges(self, group, name, keys, ptrs, sizes, offsets) -> None:
+        results = list(
+            self.storage.client.batch_get_ranges_into_ptr(keys, ptrs, sizes, offsets)
+        )
+        if len(results) != len(keys) or not all(results):
+            where = (
+                f"layer={group[0]}"
+                if len(group) == 1
+                else f"layers={group[0]}..{group[-1]}"
+            )
+            raise RuntimeError(
+                f"UMBP get failed for pool={name}, {where}: "
+                f"success={sum(bool(value) for value in results)}/{len(keys)}."
+            )
 
     def _layer_groups(self) -> list[list[int]]:
         return [
@@ -1068,6 +1117,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             if thread.is_alive():
                 queue.put(None)
                 thread.join()
+        if self._load_reads is not None:
+            self._load_reads.shutdown()
         if self._standalone_process_mode and self._registered:
             # StandaloneProcess deregistration is client-wide; one call tears
             # down every registered region. Keep the GPU tensors alive until
