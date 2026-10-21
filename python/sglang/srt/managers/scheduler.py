@@ -593,6 +593,10 @@ class Scheduler(
         self.kv_shard_widening = page_interleave_shard_size(
             self.token_to_kv_pool_allocator
         )
+        # A prompt admission can never fit would block the queue forever.
+        self.max_req_input_len = min(
+            self.max_req_input_len, self._admissible_input_len()
+        )
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
         if self.enable_hierarchical_cache:
@@ -2523,6 +2527,10 @@ class Scheduler(
             scheduler=self,
             record_step_time=RECORD_STEP_TIME,
         )
+
+    def _admissible_input_len(self) -> int:
+        # PrefillAdder charges prompt + 1 token + a page per shard on an empty pool.
+        return (self.max_total_num_tokens - self.page_size) * self.kv_shard_widening - 1
 
     def init_req_max_new_tokens(self, req):
         input_len = len(req.origin_input_ids)
