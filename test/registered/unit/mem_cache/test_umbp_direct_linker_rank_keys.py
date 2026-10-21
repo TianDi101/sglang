@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import sglang.srt.mem_cache.storage.umbp.umbp_direct_linker as umbp_direct_linker
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     UMBPDirectLinker,
     _storage_suffix,
@@ -129,6 +130,25 @@ class TestEveryRankWrites(CustomTestCase):
         self.assertFalse(linker.offload([]))
         self.assertEqual(linker._offload_results.qsize(), 0)
         self.assertEqual(linker._offload_queue.qsize(), 0)
+
+
+class TestPrefetch(CustomTestCase):
+    def test_hints_only_whole_prefix_pools(self):
+        linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
+        linker._stats = {"prefetch": 0}
+        linker._prefetch = mock.Mock()
+        full = PoolTransfer(name=PoolName.KV, hit_policy=PoolHitPolicy.ALL_PAGES)
+        tail = PoolTransfer(name=PoolName.SWA, hit_policy=PoolHitPolicy.TRAILING_PAGES)
+        linker.pool_group = SimpleNamespace(resolve_transfers=lambda _: [full, tail])
+        linker._object_keys_for_pages = lambda pages, t: (
+            [f"{t.name.value}/{page}" for page in pages],
+            1,
+        )
+        linker.prefetch("rid", [PoolTransfer(name=PoolName.KV, keys=["p0", "p1"])])
+        linker._prefetch.submit.assert_called_once_with(
+            linker._prefetch_keys,
+            [f"{PoolName.KV.value}/p0", f"{PoolName.KV.value}/p1"],
+        )
 
 
 if __name__ == "__main__":

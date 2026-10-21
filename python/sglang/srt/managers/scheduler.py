@@ -3830,6 +3830,10 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             running_batch=running_batch,
         )
+        # After admission: whoever is still waiting has time to stage its pages.
+        linker = getattr(self.tree_cache, "linker", None)
+        if linker is not None and self.waiting_queue:
+            linker.prefetch(self.waiting_queue)
 
         if self.prefill_delayer:
             observed_prefill_bs = prefill_delayer_single_pass.finalize(

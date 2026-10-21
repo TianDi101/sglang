@@ -62,6 +62,11 @@ class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools."""
 
     layer_done_counter: object
+    # Whether prefetch() does anything; spares the wrapper hashing for nothing.
+    prefetch_enabled: bool = False
+
+    def prefetch(self, rid: str, transfers: list[PoolTransfer]) -> None:
+        """Hint that a queued request will load these pages. Must not block."""
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -176,6 +181,8 @@ class UnifiedCacheLinkerWrapper:
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        # Queued rids already hinted to the store.
+        self._prefetched: set[str] = set()
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -186,6 +193,37 @@ class UnifiedCacheLinkerWrapper:
 
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
+
+    # ---- prefetch: hint queued requests' pages before admission ----
+
+    def prefetch(self, reqs: Sequence[Req]) -> None:
+        if not self.cache_linker.prefetch_enabled:
+            return
+        self._prefetched &= {req.rid for req in reqs}
+        cache = self.cache
+        for req in reqs:
+            if req.rid in self._prefetched:
+                continue
+            self._prefetched.add(req.rid)
+            key = RadixKey(
+                token_ids=req.origin_input_ids,
+                extra_key=req.extra_key,
+                cache_salt=req.cache_salt,
+            )
+            key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
+            pages = len(key) // cache.page_size * cache.page_size
+            if pages == 0:
+                continue
+            # Device-cached pages included: matching here would cost more.
+            hashes = get_storage_hash_str(key[:pages], None, page_size=cache.page_size)
+            transfers = [
+                component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOOKUP, None, hashes
+                )
+                for component in self._components
+            ]
+            if all(transfer is not None for transfer in transfers):
+                self.cache_linker.prefetch(req.rid, transfers)
 
     # ---- match: probe the remote store and report host_hit_length ----
 
