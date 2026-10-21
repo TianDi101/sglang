@@ -425,6 +425,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             "offload": 0,
             # offload / offload_batches is the coalescing actually achieved.
             "offload_batches": 0,
+            "prefetch": 0,
+            # Objects the store copied from SSD to DRAM for those requests.
+            "prefetched": 0,
         }
         self._load_thread = threading.Thread(
             target=self._load_thread_func,
@@ -439,6 +442,21 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._load_reads = (
             ThreadPoolExecutor(LOAD_READS, thread_name_prefix=f"umbp-read-tp{tp_rank}")
             if LOAD_READS > 0
+            else None
+        )
+        # Ranks sharing a key share its prefetch, so only the first of them sends it.
+        first_sharer = not rank_replicated or (
+            get_parallel().attn_tp_rank == 0
+            and (not self.pool_group.cp_replicated or params.attn_cp_rank == 0)
+        )
+        self.prefetch_enabled = (
+            first_sharer
+            and _config_bool(os.getenv("UMBP_PREFETCH") or "0", "UMBP_PREFETCH")
+            and callable(getattr(self.storage.client, "batch_prefetch", None))
+        )
+        self._prefetch = (
+            ThreadPoolExecutor(1, thread_name_prefix=f"umbp-prefetch-tp{tp_rank}")
+            if self.prefetch_enabled
             else None
         )
         self._closed = False
@@ -554,6 +572,30 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 len(valid_pages),
             )
         return valid_pages
+
+    def prefetch(self, rid: str, transfers: list[PoolTransfer]) -> None:
+        kv = next((t for t in transfers if t.name == PoolName.KV), None)
+        if kv is None or not kv.keys:
+            return
+        page_keys = list(kv.keys)
+        keys = []
+        for transfer in self.pool_group.resolve_transfers(transfers):
+            # A trailing-window pool keeps only the last pages, never the whole prefix.
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                keys.extend(self._object_keys_for_pages(page_keys, transfer)[0])
+        if keys:
+            self._stats["prefetch"] += 1
+            self._prefetch.submit(self._prefetch_keys, keys)
+
+    def _prefetch_keys(self, keys: list[str]) -> None:
+        step = CHUNK_PAGES * self.num_layers
+        try:
+            for start in range(0, len(keys), step):
+                self._stats["prefetched"] += self.storage.client.batch_prefetch(
+                    keys[start : start + step]
+                )
+        except Exception:
+            logger.exception("UMBP prefetch failed")
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Lookup establishes a restorable boundary before insert de-duplicates
@@ -1128,6 +1170,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 thread.join()
         if self._load_reads is not None:
             self._load_reads.shutdown()
+        if self._prefetch is not None:
+            self._prefetch.shutdown(cancel_futures=True)
         if self._standalone_process_mode and self._registered:
             # StandaloneProcess deregistration is client-wide; one call tears
             # down every registered region. Keep the GPU tensors alive until
