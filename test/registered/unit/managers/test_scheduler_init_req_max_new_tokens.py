@@ -227,6 +227,15 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                                     )
                                     self._init_and_check(scheduler, req)
 
+    def test_intake_stops_where_admission_does(self):
+        for widening in (1, 3):
+            scheduler = self._new_scheduler(page_size=16, kv_shard_widening=widening)
+            limit = scheduler._admissible_input_len()
+            # Disagg prefill admits prompt + 1 token + a page per shard: the
+            # last accepted prompt (limit - 1) fits, the first rejected doesn't.
+            self.assertLess((limit - 1) + 1 + 16 * widening, 1024 * widening)
+            self.assertEqual(limit + 1 + 16 * widening, 1024 * widening)
+
     def test_unified_budget_rounds_prompt_and_decode_together(self):
         bundle = init_unified_swa_pools(
             device="cpu",
